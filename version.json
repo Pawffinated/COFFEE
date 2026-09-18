@@ -1,0 +1,4 @@
+{
+  "version": "7.7.5",
+  "notes": "✓ Cart stock ceiling: a product with 5 in stock can no longer be sold 6.\n✓ All five add-to-cart paths (tile, variant picker, barcode scanner, cart + button)\n   now share one ceiling; two dead functions that looked like the fix site were removed.\n✓ Out-of-stock tiles are refused in code, not only by CSS pointer-events.\n✓ An open drawer is restored from Supabase on boot, so clearing site data or\n   reinstalling the app no longer strands a shift open in the cloud.\n✓ The cart is trimmed to real stock after a cloud pull, so another till selling\n   the last units cannot leave an unfulfillable total on screen.\n✓ Start shift can no longer be double-tapped into two drawers.\n✓ Grid scroll position is held on all five cart actions, not just the tile tap."
+}
