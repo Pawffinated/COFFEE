@@ -1886,8 +1886,13 @@ function salePayload(tx,bizId){
      customer_id lets the database apply the utang charge and the loyalty
      points in the same transaction as the sale, and reverse them on a void or
      a delete, instead of two unchecked client PATCHes that nothing undid. */
+  /* === NEW: Feature 1 — disc_type. `discount` has always been sent as a
+     peso figure (damt() resolves the percentage before it gets here), but
+     the TYPE was dropped, so a P20 sale and a 20% sale on a P100 order both
+     arrived as 20 and no report could tell them apart. === */
   return {biz_id:bizId||null,txn_id:tx.id,date:tx.date,total:tx.total,method:tx.method,
-    items:tx.items,discount:tx.disc||0,cashier:tx.cashier||'',ref:tx.ref||'',
+    items:tx.items,discount:tx.disc||0,disc_type:tx.discType||'',
+    cashier:tx.cashier||'',ref:tx.ref||'',
     voided:tx.voided||false,queue_no:tx.queueNo||null,queue_status:tx.queueStatus||'',
     queue_day:tx.queueDay||null,shift_uid:tx.shiftId||null,
     customer_id:tx.customerId||null};
@@ -2125,15 +2130,21 @@ function consumeIngredients(items,dir,applied){
       touched[ing.id]=ing;
     });
   } else {
-    if(!Array.isArray(items)||!S.recipes.length)return [];
+    /* v7.8 CHANGE (Feature 3): the `!S.recipes.length` half of this guard was
+       removed. Modifier seasonings are carried on the sale item itself and
+       have no recipe row, so a shop that uses flavours but has never built a
+       recipe was returning here and deducting nothing at all. recipesFor()
+       already yields an empty list when there are no recipes, so dropping the
+       short-circuit costs one no-op loop and nothing else. */
+    if(!Array.isArray(items))return [];
     items.forEach(function(it){
       var sold=+it.qty||0;
       if(sold<=0)return;
-      recipesFor(it.name).forEach(function(r){
-        var per=+r.qty||0;
-        if(per<=0)return;
-        var ing=ingById(r.ingId);
-        if(!ing)return;
+      /* Shared bookkeeping for both the recipe lines and the modifier lines
+         below, so a seasoning that appears in both is summed into one delta
+         and a later void reverses it exactly once. */
+      var take=function(ing,per){
+        if(!ing||per<=0)return;
         var before=+ing.stock||0;
         ing.stock=Math.max(0,ingRound(before+dir*per*sold));
         var moved=ingRound(ing.stock-before);
@@ -2142,6 +2153,25 @@ function consumeIngredients(items,dir,applied){
         if(prev)prev.delta=ingRound(prev.delta+moved);
         else deltas.push({id:ing.id,delta:moved});
         touched[ing.id]=ing;
+      };
+      recipesFor(it.name).forEach(function(r){
+        take(ingById(r.ingId),+r.qty||0);
+      });
+      /* === NEW: Feature 3 — flavour seasonings, resolved on the line at
+         checkout and carried on the sale item. Matched on name because a
+         modifier has no recipe row. Like the recipe mirror above this is
+         optimistic only: arroyo_apply_stock in the database is the single
+         writer and refreshStockFromCloud() corrects any drift, which is also
+         why no unit conversion is attempted here. An unknown ingredient name
+         is skipped rather than blocking the sale. === */
+      (it.modIngs||[]).forEach(function(r){
+        var want=arroyoNorm(r.name);
+        if(!want)return;
+        var ing=null;
+        for(var q=0;q<S.ings.length;q++){
+          if(arroyoNorm(S.ings[q].name)===want){ing=S.ings[q];break;}
+        }
+        take(ing,+r.qty||0);
       });
     });
   }
@@ -2599,7 +2629,7 @@ async function loadCloudData(silent){
         }
         return {id:lid,name:p.name,price:p.price,cat:p.cat,icon:p.icon||'ITEM',
           stock:p.stock,variants:p.variants||[],img:img,
-          salePct:p.sale_pct||0,barcode:p.barcode||''};
+          salePct:p.sale_pct||0,saleAmt:p.sale_amt||0,barcode:p.barcode||''};   /* NEW: Feature 1 */
       });
       if(imgGaps>0){
         console.warn('[Arroyo] '+imgGaps+' product photo(s) kept from this device - '
@@ -2692,7 +2722,7 @@ async function saveProductsToCloud(){
          till had made since this device last pulled. Stock is the database's
          number; it is only ever sent below, on the INSERT of a product the
          cloud has never seen. */
-      const row={biz_id:CLOUD.bizId,local_id:p.id,name:p.name,price:p.price,cat:p.cat,icon:p.icon,sale_pct:p.salePct||0,barcode:p.barcode||null};
+      const row={biz_id:CLOUD.bizId,local_id:p.id,name:p.name,price:p.price,cat:p.cat,icon:p.icon,sale_pct:p.salePct||0,sale_amt:p.saleAmt||0,barcode:p.barcode||null};   /* NEW: Feature 1 */
       /* Only send img when this device actually has one. The old row always
          carried `img: p.img || null`, so a till with no photo for a product
          overwrote the cloud copy with null - which is how 28 products ended
@@ -3545,6 +3575,312 @@ function exportCSV(sales){
    availUnits() is now the single answer to "how many of this can still be
    sold", and cartAdd()/cartSetQty() are the only two ways the cart is
    allowed to change. 999 means unlimited and stays uncapped by design. */
+/* ==================== NEW: Feature 2/3/4/5 — CONFIG ====================
+   Everything the shop owner is expected to edit lives in this one block.
+   Nothing below reads from Supabase, so the config is safe to change and
+   redeploy without touching the database.
+
+   FUTURE VARIANTS (not yet implemented — owner to configure manually):
+   - Mini Corndog / Regular Corndog: qty (3pc / 6pc / 12pc)?
+   - Munchkins with Marshmallow: qty variant?
+   - Pastillas De Leche: qty variant?
+   - Hot Drinks (Brewed Coffee, Espresso, etc.): size variant (solo/double)?
+   - Streetfood Platter: composition variant (what's included)?
+   - Hawaiian Pizza / Ham & Cheese Pizza: slice count variant?
+   - Blue Lemonade (standalone): size variant?
+   Hot Drinks deliberately get no sugar/add-on prompt: the menu sells them
+   plain and the owner asked for size first, which needs a size field the
+   POS does not have yet.
+======================================================================== */
+
+/* FEATURE 2 — QR payment image.
+   THE SHOP OWNER SETS THEIR QR HERE. Either a hosted image URL
+   ('https://.../gcash-qr.png') or a data: URI pasted straight in. An empty
+   string is valid: the QR payment method still records the sale and still
+   stays out of the cash drawer, it just shows a "no image configured" note
+   instead of a picture. A data: URI is the safer choice for a shop with
+   flaky internet, because the POS runs offline from a service worker and a
+   remote URL will not load when the connection drops. */
+var QR_PAYMENT_IMAGE_URL='data:image/png;base64,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';
+
+/* Shown under the QR so the cashier knows which account they are looking
+   at. Cosmetic only. */
+/* The QR above already has "GP Pawffinated" printed under it, so this is
+   blank to avoid showing the name twice. Set it if you swap in a bare QR. */
+var QR_PAYMENT_LABEL='';
+
+/* FEATURE 3/5 — the fries flavour list, shared by French Fries, Trio Fries,
+   the sandwich/burger plates and the combos. `primary` puts a flavour in the
+   highlighted first row; everything else falls under "More flavours". */
+var ARROYO_FRIES_FLAVORS=[
+  {v:'BBQ',primary:true},
+  {v:'Cheese',primary:true},
+  {v:'Sour Cream',primary:true},
+  {v:'Salted Egg'},
+  {v:'Plain'},
+  {v:'Chili Cheese'},
+  {v:'Garlic Parmesan'},
+  {v:'Truffle'},
+  {v:'Butter'},
+  {v:'Sweet Chili'}
+];
+
+/* FEATURE 4E/4F/4G — drink add-ons, priced exactly as the menu board.
+   `delta` is added to the LINE price, not raised as a separate cart line. */
+var ARROYO_ADDONS=[
+  {v:'Extra Syrup',delta:30},
+  {v:'Extra Caramel Sauce',delta:35},
+  {v:'Extra Chocolate Sauce',delta:35},
+  {v:'Extra Espresso',delta:40},
+  {v:'Extra Whip',delta:40},
+  {v:'Seasalt Cream',delta:40},
+  {v:'Sub Oat Milk',delta:50}
+];
+
+/* The modifier groups themselves.
+   mode 'single' = pick exactly one (radio). mode 'multi' = pick several.
+   required + def  : the group cannot be left blank; def is preselected, so
+                     a cashier who just hits Add still gets a valid line.
+   max (multi only): 0 means unlimited. 3 is the Trio Fries ceiling.
+   delta           : peso added to the line price for that option. */
+var ARROYO_MOD_GROUPS={
+  friesFlavor:{label:'Fries flavour',mode:'single',required:true,def:'Plain',
+               options:ARROYO_FRIES_FLAVORS},
+  friesTrio:  {label:'Fries flavours',mode:'multi',min:1,max:3,
+               options:ARROYO_FRIES_FLAVORS},
+  egg:        {label:'Egg',mode:'single',required:true,def:'With Egg',
+               options:[{v:'With Egg'},{v:'Without Egg'}]},
+  rice:       {label:'Rice',mode:'single',required:true,def:'Regular Rice',
+               options:[{v:'Regular Rice'},{v:'Extra Rice',delta:30}]},
+  toast:      {label:'Toasted bread',mode:'single',required:true,def:'With Toasted Bread',
+               options:[{v:'With Toasted Bread'},{v:'Without Toasted Bread'}]},
+  /* 4C: the menu board prices no double patty, so the upcharge is 0 until
+     the owner sets one. Change the delta below and it applies everywhere. */
+  patty:      {label:'Patty',mode:'single',required:true,def:'Regular',
+               options:[{v:'Regular'},{v:'Double Patty',delta:0}]},
+  sugar:      {label:'Sugar level',mode:'single',required:true,def:'Normal Sugar',
+               options:[{v:'Normal Sugar'},{v:'Less Sugar'},{v:'No Sugar'}]},
+  addons:     {label:'Add-ons',mode:'multi',min:0,max:0,options:ARROYO_ADDONS}
+};
+
+/* FEATURE 3 — flavour to ingredient. Keyed on the option value, so it works
+   for a single flavour and for each of the three Trio flavours alike.
+   An ingredient named here that does not exist in the Prep module is
+   skipped silently, both on this device and in the database, so a shop that
+   has not set up seasoning stock is never blocked from selling.
+   Names must match the Prep > Ingredients name EXACTLY (case-insensitive). */
+var ARROYO_MOD_INGREDIENTS={
+  'BBQ':            [{name:'BBQ Seasoning',qty:1,unit:'pack'}],
+  'Cheese':         [{name:'Cheese Powder',qty:1,unit:'pack'}],
+  'Sour Cream':     [{name:'Sour Cream Sauce',qty:1,unit:'pack'}],
+  'Salted Egg':     [{name:'Salted Egg Powder',qty:1,unit:'pack'}],
+  'Plain':          [],
+  'Chili Cheese':   [{name:'Chili Cheese Seasoning',qty:1,unit:'pack'}],
+  'Garlic Parmesan':[{name:'Garlic Parmesan Seasoning',qty:1,unit:'pack'}],
+  'Truffle':        [{name:'Truffle Seasoning',qty:1,unit:'pack'}],
+  'Butter':         [{name:'Butter Seasoning',qty:1,unit:'pack'}],
+  'Sweet Chili':    [{name:'Sweet Chili Seasoning',qty:1,unit:'pack'}]
+  /* Add-ons and rice/egg options deduct nothing by default. To wire one up,
+     add a line here, e.g.
+       'Extra Espresso':[{name:'Coffee Beans',qty:18,unit:'g'}],
+       'Extra Rice':    [{name:'Rice',qty:1,unit:'cup'}],
+     and the same deduction happens on the till and in the database. */
+};
+
+/* Products that must never be asked a modifier question. The three menu
+   add-on lines are sold as their own items, and bottled water is not a
+   made-to-order drink. Normalised names — see arroyoNorm(). */
+var ARROYO_MOD_SKIP=['extraegg','extrarice','bottledwater'];
+
+/* Rice Meals, by name, because this build cannot see the live category
+   names. Category matching is tried first; this list is the fallback.
+   NOTE the deliberate collision guard: the menu has a Hungarian Sausage in
+   Snacks (with fries) and another in Rice Meals. They are told apart by the
+   "fries" keyword, so the snack gets a flavour prompt and the rice meal
+   gets egg + rice. If the live product names do not carry "w/ fries", fix
+   it by moving the snack out of this list rather than by renaming. */
+var ARROYO_RICE_NAMES=['chickencurry','chickenpeppersauce','sisigwithoutegg',
+  'hungariansausage','spamwithegg','sisigwithegg','spicychickenpoppers',
+  'tocinowithegg'];
+
+/* Iced Coffee + Non Coffee + Ice Blended, by name, same fallback reason.
+   Hot Drinks are intentionally absent (see the note at the top). */
+var ARROYO_DRINK_NAMES=['americano','hazelnutamericano','cafelatte',
+  'frenchvanillalatte','hazelnutlatte','spanishlatte','vanillalatte',
+  'tigersugarwespresso','caramelmacchiato','saltedcaramel','milodinosaur',
+  'milodinosaurwithespresso','seasaltcaramellatte','mocha','whitemocha',
+  'seasaltspanish','darkmocha','baristasdrink','dirtymatcha','biscofflatte',
+  'bluelemonade','tigersugarlatte','milkycaramel','passionfruittea',
+  'icedchocolate','strawberrylatte','icedwhitechocolatewithcarameldrizzle',
+  'iceddarkchocolate','matchalatte','strawberrymatcha','biscoffmilk',
+  'seasaltmatcha','plainyogurt','strawberryyogurt','blueberryyogurt','matcha',
+  'cookiescreamoverload','javachipoverload'];
+
+/* ==================== NEW: Feature 3/4/5 — ENGINE ======================
+   All of this is new and self-contained. The only existing functions that
+   had to change are cartLineQty/cartAdd/cartSetQty/reconcileCartToStock,
+   and each change is marked at its own site.
+======================================================================== */
+
+/* Lowercase, alphanumerics only. "Grilled Ham & Cheese Sandwich w/ fries"
+   becomes "grilledhamcheesesandwichwfries", which survives punctuation and
+   spacing drift between the menu board and the product list. */
+/* === NEW: Feature 1 — per-item peso sale.
+   The expression `(p.salePct>0)?p.price*(1-p.salePct/100):p.price` was
+   written out at three separate add-to-cart sites (tile, inventory row,
+   barcode scan). Adding a second kind of sale to three copies is how they
+   drift apart, so the arithmetic lives here once and those three sites call
+   it instead.
+
+   ORDER OF OPERATIONS, and the reason for it: the percentage comes off
+   first, then the peso amount. A product marked "20% off" and "P5 off" at
+   P100 sells for P75, not P76. Percent-then-peso is the order a cashier
+   reads the two fields in, and it is the order that makes the peso figure
+   mean exactly what it says on the tile. The result is floored at 0 so a
+   peso sale larger than the price can never produce a negative line. === */
+function arroyoEffPrice(p){
+  if(!p)return 0;
+  var base=+p.price||0;
+  var pct=+p.salePct||0;
+  var amt=+p.saleAmt||0;
+  if(pct>0)base=base*(1-Math.min(pct,100)/100);
+  if(amt>0)base=base-amt;
+  return +Math.max(0,base).toFixed(2);
+}
+/* True when the product is discounted by either mechanism — used to decide
+   whether to show the struck-through original price and the SALE badge. */
+function arroyoOnSale(p){return !!p&&((+p.salePct||0)>0||(+p.saleAmt||0)>0);}
+/* The badge text: "-20%", "-P5.00", or both. */
+function arroyoSaleBadge(p){
+  if(!p)return '';
+  var bits=[];
+  if((+p.salePct||0)>0)bits.push('-'+p.salePct+'%');
+  if((+p.saleAmt||0)>0)bits.push('-'+fmt(p.saleAmt));
+  return bits.join(' ');
+}
+
+function arroyoNorm(s){return String(s==null?'':s).toLowerCase().replace(/[^a-z0-9]/g,'');}
+
+/* Which modifier groups a product should ask about. Pure function of the
+   product's name and category, so it needs no stored configuration on the
+   product row and nothing in Supabase changes. */
+function arroyoModGroupsFor(p){
+  if(!p||!p.name)return [];
+  var n=arroyoNorm(p.name),c=arroyoNorm(p.cat||''),g=[];
+  if(ARROYO_MOD_SKIP.indexOf(n)>-1)return [];
+  /* Trio is checked before plain fries so "Trio Fries" gets the 3-pick
+     group and not the single-pick one. */
+  if(n.indexOf('fries')>-1){
+    if(n.indexOf('trio')>-1)g.push('friesTrio');else g.push('friesFlavor');
+  }
+  if(n.indexOf('burger')>-1)g.push('patty');
+  if(n.indexOf('pancit')>-1){g.push('egg');g.push('toast');}
+  var isRice=c.indexOf('ricemeal')>-1||ARROYO_RICE_NAMES.indexOf(n)>-1;
+  if(isRice){
+    /* Sisig with Egg, Sisig without Egg, Spam with Egg and Tocino with Egg
+       are already separate menu items, so a product whose own name settles
+       the egg question is never asked it. One rule covers all four. */
+    if(n.indexOf('egg')<0&&g.indexOf('egg')<0)g.push('egg');
+    if(g.indexOf('rice')<0)g.push('rice');
+  }
+  var isDrink=c.indexOf('icedcoffee')>-1||c.indexOf('noncoffee')>-1
+            ||c.indexOf('iceblended')>-1||ARROYO_DRINK_NAMES.indexOf(n)>-1;
+  if(isDrink){g.push('sugar');g.push('addons');}
+  return g;
+}
+function arroyoHasMods(p){return arroyoModGroupsFor(p).length>0;}
+
+/* The selection itself is {groupKey:[values]}. Kept as a plain object so it
+   drops straight into the sale item JSON with no encoding step. */
+function arroyoModDefaults(groups){
+  var sel={};
+  (groups||[]).forEach(function(k){
+    var d=ARROYO_MOD_GROUPS[k];
+    if(!d)return;
+    sel[k]=(d.mode==='single'&&d.required&&d.def)?[d.def]:[];
+  });
+  return sel;
+}
+/* Stable identity for a selection, so two lines of the same product differ
+   in the cart when and only when their modifiers differ. Sorted on both
+   axes: the cashier tapping Cheese then BBQ must land on the same line as
+   the cashier who tapped BBQ then Cheese. */
+function arroyoModKey(sel){
+  if(!sel)return '';
+  return Object.keys(sel).sort().map(function(k){
+    var v=(sel[k]||[]).slice().sort();
+    return v.length?k+'='+v.join('+'):'';
+  }).filter(Boolean).join('|');
+}
+/* Cart / receipt summary: "BBQ / Cheese · Less Sugar · +Extra Whip (+P40)" */
+function arroyoModLabel(sel){
+  if(!sel)return '';
+  var parts=[];
+  Object.keys(sel).forEach(function(k){
+    var d=ARROYO_MOD_GROUPS[k],v=sel[k]||[];
+    if(!d||!v.length)return;
+    if(k==='addons'){
+      v.forEach(function(x){
+        var o=d.options.find(function(y){return y.v===x;});
+        parts.push('+'+x+(o&&o.delta?' (+'+fmt(o.delta).replace(/\s/g,'')+')':''));
+      });
+    } else {
+      var seg=v.join(' / ');
+      var extra=v.reduce(function(a,x){
+        var o=d.options.find(function(y){return y.v===x;});
+        return a+((o&&o.delta)||0);
+      },0);
+      parts.push(seg+(extra?' (+'+fmt(extra).replace(/\s/g,'')+')':''));
+    }
+  });
+  return parts.join(' · ');
+}
+/* Peso added to the unit price by the selection. */
+function arroyoModDelta(sel){
+  if(!sel)return 0;
+  var t=0;
+  Object.keys(sel).forEach(function(k){
+    var d=ARROYO_MOD_GROUPS[k];
+    if(!d)return;
+    (sel[k]||[]).forEach(function(x){
+      var o=d.options.find(function(y){return y.v===x;});
+      if(o&&o.delta)t+=+o.delta||0;
+    });
+  });
+  return t;
+}
+/* The ingredient lines a selection consumes, summed per ingredient name so
+   three flavours that share a seasoning deduct it three times as one entry.
+   This list is written onto the sale item, which is what lets the database
+   apply the same deduction without knowing the flavour config. */
+function arroyoModIngs(sel){
+  if(!sel)return [];
+  var acc={};
+  Object.keys(sel).forEach(function(k){
+    (sel[k]||[]).forEach(function(x){
+      (ARROYO_MOD_INGREDIENTS[x]||[]).forEach(function(r){
+        var key=arroyoNorm(r.name)+'|'+(r.unit||'');
+        if(acc[key])acc[key].qty=ingRound(acc[key].qty+(+r.qty||0));
+        else acc[key]={name:r.name,qty:+r.qty||0,unit:r.unit||''};
+      });
+    });
+  });
+  return Object.keys(acc).map(function(k){return acc[k];});
+}
+/* Validation, in the cashier's words. Returns '' when the selection is
+   good, otherwise the message to show inline. */
+function arroyoModError(sel,groups){
+  for(var i=0;i<(groups||[]).length;i++){
+    var k=groups[i],d=ARROYO_MOD_GROUPS[k];
+    if(!d)continue;
+    var v=(sel&&sel[k])||[];
+    var min=d.mode==='multi'?(d.min||0):(d.required?1:0);
+    if(v.length<min)return 'Choose '+(min>1?min+' ':'')+'a '+d.label.toLowerCase();
+    if(d.mode==='multi'&&d.max&&v.length>d.max)return 'Maximum '+d.max+' flavours';
+  }
+  return '';
+}
+
 function availUnits(p,variantLabel){
   if(!p)return 0;
   if(variantLabel&&p.variants&&p.variants.length){
@@ -3558,8 +3894,15 @@ function availUnits(p,variantLabel){
 /* Matched on id AND variant, so two variants of one product hold separate
    ceilings instead of sharing the parent's. */
 function cartLineQty(id,variantLabel){
-  var l=S.cart.find(function(i){return i.id===id&&(i.variantLabel||'')===(variantLabel||'');});
-  return l?(+l.qty||0):0;
+  /* v7.8 CHANGE (Feature 3/4/5): was a .find() returning one line's qty.
+     Modifiers split one product across several cart lines — French Fries
+     BBQ and French Fries Cheese are two lines drawing on ONE stock figure —
+     so a per-line answer let 5 in stock be sold as 5 + 5. This sums every
+     line of the same product/variant regardless of modifier, which is also
+     what the old single-line case returns. */
+  return S.cart.reduce(function(s,i){
+    return s+((i.id===id&&(i.variantLabel||'')===(variantLabel||''))?(+i.qty||0):0);
+  },0);
 }
 function stockMsg(cap,name,variantLabel){
   return cap<=0
@@ -3577,7 +3920,11 @@ function cartAdd(p,variantLabel,line,step){
     toast(stockMsg(cap,p.name,variantLabel));
     return false;
   }
-  var ex=S.cart.find(function(i){return i.id===p.id&&(i.variantLabel||'')===(variantLabel||'');});
+  /* v7.8 CHANGE (Feature 3/4/5): modKey added to the match. Without it a
+     second flavour of the same product incremented the first flavour's line
+     instead of opening its own. */
+  var mk=(line&&line.modKey)||'';
+  var ex=S.cart.find(function(i){return i.id===p.id&&(i.variantLabel||'')===(variantLabel||'')&&(i.modKey||'')===mk;});
   if(ex)ex.qty=(+ex.qty||0)+step;else S.cart.push(line);
   return true;
 }
@@ -3589,7 +3936,10 @@ function cartSetQty(idx,delta){
   if(delta>0){
     var p=S.prods.find(function(x){return x.id===it.id;});
     var cap=availUnits(p,it.variantLabel);
-    if((+it.qty||0)+delta>cap){toast(stockMsg(cap,it.name,it.variantLabel));return false;}
+    /* v7.8 CHANGE (Feature 3/4/5): was (+it.qty||0)+delta, this line only.
+       With modifiers the ceiling belongs to the product, so the + button has
+       to count every flavour line already in the cart. */
+    if(cartLineQty(it.id,it.variantLabel)+delta>cap){toast(stockMsg(cap,it.name,it.variantLabel));return false;}
   }
   it.qty=(+it.qty||0)+delta;
   if(it.qty<=0)S.cart.splice(idx,1);
@@ -3600,16 +3950,26 @@ function cartSetQty(idx,delta){
    payment screen with a total that cannot be fulfilled. Trims quietly and
    reports what it changed so the caller can say so once. */
 function reconcileCartToStock(){
-  var trimmed=[];
+  /* v7.8 CHANGE (Feature 3/4/5): the cap is now shared. Each modifier line
+     used to be trimmed against the full figure, so three flavour lines of a
+     product with 2 left survived as 2 + 2 + 2. `seen` carries the units
+     already granted; later lines in the cart are served first, which is
+     arbitrary but deterministic. */
+  var trimmed=[],seen={};
   for(var i=S.cart.length-1;i>=0;i--){
     var it=S.cart[i];
     var p=S.prods.find(function(x){return x.id===it.id;});
     var cap=availUnits(p,it.variantLabel);
     if(!isFinite(cap))continue;
-    if((+it.qty||0)>cap){
-      trimmed.push(it.name+(it.variantLabel?' ('+it.variantLabel+')':''));
-      if(cap<=0)S.cart.splice(i,1);else it.qty=cap;
+    var key=it.id+'|'+(it.variantLabel||'');
+    var used=seen[key]||0;
+    var room=Math.max(0,cap-used);
+    var q=+it.qty||0;
+    if(q>room){
+      trimmed.push(it.name+(it.variantLabel?' ('+it.variantLabel+')':'')+(it.modLabel?' - '+it.modLabel:''));
+      if(room<=0){S.cart.splice(i,1);q=0;}else{it.qty=room;q=room;}
     }
+    seen[key]=used+q;
   }
   return trimmed;
 }
@@ -4472,7 +4832,10 @@ function renderCloudAuth(app){
    cashier name, and only fall all the way back to time-only when the shift
    has no cashier recorded at all. */
 function shiftSalesBreakdown(sh){
-  const out={cash:0,gcash:0,credit:0,other:0,total:0,count:0,voided:0};
+  /* === NEW: Feature 2 — `qr` added. expectedDrawer() reads ONLY out.cash,
+     so QR is excluded from the cash count by construction, exactly as GCash
+     already was. === */
+  const out={cash:0,gcash:0,qr:0,credit:0,other:0,total:0,count:0,voided:0};
   if(!sh)return out;
   const from=new Date(sh.startedAt).getTime();
   const to=sh.endedAt?new Date(sh.endedAt).getTime():Date.now();
@@ -4491,6 +4854,7 @@ function shiftSalesBreakdown(sh){
     const m=s.method||'Cash';
     if(m==='Cash')out.cash+=amt;
     else if(m==='GCash')out.gcash+=amt;
+    else if(m==='QR')out.qr+=amt;
     else if(m==='Utang')out.credit+=amt;
     else out.other+=amt;
   });
@@ -4626,7 +4990,8 @@ function renderCashierLogin(app){
    notes in the till — GCash and credit are revenue but never cash on hand, so
    a cash figure that included them would never reconcile against the drawer. */
 function salesOnDayBreakdown(key){
-  const out={cash:0,gcash:0,credit:0,other:0,total:0,count:0};
+  /* === NEW: Feature 2 — `qr` added, same reasoning as shiftSalesBreakdown. === */
+  const out={cash:0,gcash:0,qr:0,credit:0,other:0,total:0,count:0};
   (S.sales||[]).forEach(function(s){
     if(s.voided)return;
     if(dayKey(s.date)!==key)return;
@@ -4635,6 +5000,7 @@ function salesOnDayBreakdown(key){
     const m=s.method||'Cash';
     if(m==='Cash')out.cash+=amt;
     else if(m==='GCash')out.gcash+=amt;
+    else if(m==='QR')out.qr+=amt;
     else if(m==='Utang')out.credit+=amt;
     else out.other+=amt;
   });
@@ -4675,6 +5041,8 @@ function renderExp(scr){
     {l:'Net profit',v:fmt(dayNet),c:dayNet>=0?'color:var(--st)':'color:var(--dt)'},
     {l:'Cash sales',v:fmt(bdown.cash),c:'color:var(--st)'},
     {l:'GCash',v:fmt(bdown.gcash),c:'color:var(--pt)'},
+    /* === NEW: Feature 2 — QR gets its own tile beside Cash and GCash. === */
+    {l:'QR / InstaPay',v:fmt(bdown.qr),c:'color:var(--ac)'},
     {l:'Cash on hand',v:fmt(cashOnHand),c:cashOnHand>=0?'color:var(--ac)':'color:var(--dt)'}
   ];
   // Credit only earns a tile on days it was actually used.
@@ -4693,6 +5061,7 @@ function renderExp(scr){
   cohNote.style.cssText='margin:0 16px 4px;font-size:11.5px;color:var(--t3);line-height:1.6';
   const excluded=[];
   if(bdown.gcash>0)excluded.push('GCash '+fmt(bdown.gcash));
+  if(bdown.qr>0)excluded.push('QR '+fmt(bdown.qr));   /* NEW: Feature 2 */
   if(bdown.credit>0)excluded.push('credit '+fmt(bdown.credit));
   if(bdown.other>0)excluded.push('other tender '+fmt(bdown.other));
   cohNote.textContent='Cash on hand = cash sales '+fmt(bdown.cash)+' − expenses '+fmt(dayExpAmt)+'.'
@@ -4770,6 +5139,7 @@ function renderExp(scr){
       // The cash line is what a drawer count for that day should come back to.
       parts.push('cash on hand '+fmt(dayBd.cash-dTot));
       if(dayBd.gcash>0)parts.push('GCash '+fmt(dayBd.gcash));
+      if(dayBd.qr>0)parts.push('QR '+fmt(dayBd.qr));   /* NEW: Feature 2 */
       if(dayBd.credit>0)parts.push('credit '+fmt(dayBd.credit));
     }
     dsub.textContent=parts.join(' · ');
@@ -4955,18 +5325,18 @@ function renderPOS(scr){
   grid.style.paddingBottom=n>0?'100px':'12px';
   sorted.forEach(p=>{
     const out=p.stock!==999&&p.stock<=0,low=p.stock!==999&&p.stock>0&&p.stock<=5;
-    const effPrice=(p.salePct>0)?+(p.price*(1-p.salePct/100)).toFixed(2):p.price;
+    const effPrice=arroyoEffPrice(p);   /* NEW: Feature 1 — was inline pct-only */
     const card=document.createElement('div');
-    card.className='pcard'+(low?' low':'')+(out?' out':'')+(p.salePct>0?' on-sale':'');
+    card.className='pcard'+(low?' low':'')+(out?' out':'')+(arroyoOnSale(p)?' on-sale':'');
     const inner=document.createElement('div');inner.className='pcard-inner';
-    if(p.salePct>0){const sb=document.createElement('div');sb.className='sale-badge';sb.textContent='SALE -'+p.salePct+'%';inner.appendChild(sb);}
+    if(arroyoOnSale(p)){const sb=document.createElement('div');sb.className='sale-badge';sb.textContent='SALE '+arroyoSaleBadge(p);inner.appendChild(sb);}
     if(p.img){
       const im=document.createElement('img');im.src=p.img;im.className='pimg';im.onerror=function(){this.style.display='none';};inner.appendChild(im);
     } else {
       const ico=document.createElement('div');ico.className='pico';ico.textContent=p.icon;inner.appendChild(ico);
     }
     const pnm=document.createElement('div');pnm.className='pname';pnm.textContent=p.name;inner.appendChild(pnm);
-    if(p.salePct>0){
+    if(arroyoOnSale(p)){
       const po=document.createElement('div');po.className='pprice-orig';po.textContent=fmt(p.price);inner.appendChild(po);
       const ps=document.createElement('div');ps.className='pprice-sale';ps.textContent=fmt(effPrice);inner.appendChild(ps);
     } else {
@@ -4989,7 +5359,15 @@ function renderPOS(scr){
          another rule was editing. The tile is still styled as disabled;
          this is the part that actually enforces it. */
       if(availUnits(p,null)<=0){toast(p.name+' is out of stock');return;}
-      if(cartAdd(p,null,{id:p.id,name:p.name,price:effPrice,qty:1,note:'',cat:p.cat||'Uncategorised',origPrice:p.salePct>0?p.price:null,salePct:p.salePct||0}))toast(p.name+' added');
+      /* === NEW: Feature 3/4/5 — ask the modifier questions before the line
+         reaches the cart. Placed AFTER the out-of-stock refusal so a sold-out
+         product never opens a flavour picker the cashier cannot complete. === */
+      if(arroyoHasMods(p)){
+        openModal({type:'modPick',prod:p,variantLabel:'',basePrice:effPrice,
+          origPrice:arroyoOnSale(p)?p.price:null,salePct:p.salePct||0,saleAmt:p.saleAmt||0});
+        return;
+      }
+      if(cartAdd(p,null,{id:p.id,name:p.name,price:effPrice,qty:1,note:'',cat:p.cat||'Uncategorised',origPrice:arroyoOnSale(p)?p.price:null,salePct:p.salePct||0,saleAmt:p.saleAmt||0}))toast(p.name+' added');
       render();
     };
     grid.appendChild(card);
@@ -5027,6 +5405,13 @@ function renderCart(scr){
     const nm=document.createElement('div');nm.className='ci-name';nm.textContent=it.name+(it.variantLabel?' ('+it.variantLabel+')':'');
     const pr=document.createElement('div');pr.className='ci-price';pr.textContent=fmt(it.price)+' each';
     info.appendChild(nm);info.appendChild(pr);
+    /* === NEW: Feature 3/4/5 — variant summary on its own line, above the
+       note, so a long flavour list does not push the price out of view. === */
+    if(it.modLabel){
+      const md=document.createElement('div');
+      md.style.cssText='font-size:11px;font-weight:600;color:var(--pt);margin-top:2px;line-height:1.35';
+      md.textContent=it.modLabel;info.appendChild(md);
+    }
     if(it.note){const nt=document.createElement('div');nt.className='ci-note';nt.textContent='📝 '+it.note;info.appendChild(nt);}
     const nb=document.createElement('button');nb.className='ci-note-btn';nb.textContent=it.note?'edit note':'+ note';nb.onclick=function(){openModal({type:'itemNote',idx});};
     info.appendChild(nb);
@@ -5138,6 +5523,8 @@ function renderCart(scr){
   [
     {id:'Cash',lbl:'CASH'},
     {id:'GCash',lbl:'GCASH'},
+    /* === NEW: Feature 2 === */
+    {id:'QR',lbl:'QR'},
   ].forEach(pm=>{
     const btn=document.createElement('button');btn.className='pbtn';btn.textContent=pm.lbl;
     btn.onclick=function(){S.cashTendered=0;openModal({type:'pay',method:pm.id});};
@@ -5186,10 +5573,18 @@ function renderDrawerSection(scr){
     box.appendChild(drawerRow('+ Cash sales ('+bd.count+' txn)',fmt(bd.cash),{color:'var(--st)'}));
     if(paid>0)box.appendChild(drawerRow('− Cash paid out',fmt(paid),{color:'var(--wt)'}));
     box.appendChild(drawerRow('Expected in drawer',fmt(exp),{big:true,rule:true,color:'var(--ac)'}));
-    if(bd.gcash>0||bd.credit>0){
+    /* === NEW: Feature 2 — QR added to the excluded figure and named in the
+       note, so the cashier can see why the expected drawer is lower than the
+       day's takings. === */
+    if(bd.gcash>0||bd.qr>0||bd.credit>0){
       const n=document.createElement('div');
       n.style.cssText='font-size:11px;color:var(--t3);padding-top:7px;line-height:1.5';
-      n.textContent='Excludes '+fmt(bd.gcash+bd.credit)+' taken by GCash or credit — no notes changed hands.';
+      const src2=[];
+      if(bd.gcash>0)src2.push('GCash');
+      if(bd.qr>0)src2.push('QR');
+      if(bd.credit>0)src2.push('credit');
+      n.textContent='Excludes '+fmt(bd.gcash+bd.qr+bd.credit)+' taken by '
+        +src2.join(' / ')+' — no notes changed hands.';
       box.appendChild(n);
     }
     const cbtn=document.createElement('button');
@@ -5394,7 +5789,7 @@ async function loadAttEmployees(){
           endedAt:new Date().toISOString(),paidOut:po,
           expected:Math.round(expectedDrawer(S.openShift,po)*100)/100,
           countedCash:null,variance:0,unreconciled:true,
-          cashSales:b.cash,gcashSales:b.gcash,creditSales:b.credit,
+          cashSales:b.cash,gcashSales:b.gcash,qrSales:b.qr,creditSales:b.credit,
           otherSales:b.other,totalSales:b.total,txCount:b.count,
           closeNote:'Cashier deactivated on the Dashboard — drawer never counted',
           cloudSynced:false
@@ -5457,12 +5852,14 @@ function renderInv(scr){
     const ir=document.createElement('div');ir.className='inv-r';
 
     // Price (sale or regular)
-    const invEffPrice=(p.salePct>0)?+(p.price*(1-p.salePct/100)).toFixed(2):p.price;
-    if(p.salePct>0){
+    const invEffPrice=arroyoEffPrice(p);   /* NEW: Feature 1 — was inline pct-only */
+    /* NEW: Feature 1 — was `p.salePct>0`, which left a peso-only sale showing
+       the regular price here while the POS tile showed the discounted one. */
+    if(arroyoOnSale(p)){
       const pd=document.createElement('div');pd.style.cssText='text-align:right';
       const po=document.createElement('div');po.className='pprice-orig';po.style.fontSize='11px';po.textContent=fmt(p.price);
       const ps=document.createElement('div');ps.className='pprice-sale';ps.style.fontSize='14px';ps.textContent=fmt(invEffPrice);
-      const sl=document.createElement('div');sl.style.cssText='font-size:9px;color:var(--df);font-weight:700';sl.textContent='-'+p.salePct+'% SALE';
+      const sl=document.createElement('div');sl.style.cssText='font-size:9px;color:var(--df);font-weight:700';sl.textContent=arroyoSaleBadge(p)+' SALE';
       pd.appendChild(po);pd.appendChild(ps);pd.appendChild(sl);ir.appendChild(pd);
     } else {
       const pr2=document.createElement('div');pr2.className='inv-price';pr2.textContent=fmt(p.price);ir.appendChild(pr2);
@@ -5807,6 +6204,13 @@ function renderPrepRecipes(scr){
 const PAY_METHODS=[
   {id:'Cash', lbl:'Cash',  c:'var(--st)', always:true},
   {id:'GCash',lbl:'GCash', c:'var(--pt)', always:true},
+  /* === NEW: Feature 2 — QR (GCash/Maya/InstaPay scan-to-pay). Listed here
+     and every report that reads PAY_METHODS splits it out on its own row
+     automatically: tallyByMethod(), methodRows(), the day summary and the
+     history export all key off this array. It is NOT folded into GCash
+     because the owner needs to reconcile the scanned QR account separately
+     from GCash sent by transfer. === */
+  {id:'QR',   lbl:'QR / InstaPay', c:'var(--ac)', always:true},
   {id:'Utang',lbl:'Credit',c:'var(--wt)', always:false, credit:true},
 ];
 
@@ -6317,7 +6721,7 @@ function renderAdmin(scr){
               endedAt:new Date().toISOString(),paidOut:po,
               expected:Math.round(expectedDrawer(S.openShift,po)*100)/100,
               countedCash:null,variance:0,unreconciled:true,
-              cashSales:b.cash,gcashSales:b.gcash,creditSales:b.credit,
+              cashSales:b.cash,gcashSales:b.gcash,qrSales:b.qr,creditSales:b.credit,
               otherSales:b.other,totalSales:b.total,txCount:b.count,
               closeNote:'Cashier removed before the drawer was counted',
               cloudSynced:false
@@ -6354,7 +6758,7 @@ function renderAdmin(scr){
     // Reference number toggle
   const refToggleRow=document.createElement('div');
   refToggleRow.style.cssText='display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid var(--b1);margin-top:4px';
-  refToggleRow.innerHTML='<div><div style="font-size:14px;font-weight:600">Require reference number</div><div style="font-size:12px;color:var(--t3);margin-top:2px">Card & GCash must enter ref/transaction number</div></div>';
+  refToggleRow.innerHTML='<div><div style="font-size:14px;font-weight:600">Require reference number</div><div style="font-size:12px;color:var(--t3);margin-top:2px">GCash, QR & card must enter ref/transaction number</div></div>';
   const tog=document.createElement('div');
   tog.style.cssText='width:52px;height:28px;border-radius:20px;cursor:pointer;flex-shrink:0;position:relative;background:'+(S.requireRef?'var(--ac)':'var(--bg3)');
   const knb=document.createElement('div');
@@ -6957,7 +7361,7 @@ function renderModal(app){
         confirmBtn.dataset.busy='1';confirmBtn.disabled=true;
         const txid=txId();
         const payMethod=S.chargeToUtang?'Utang':'Cash';
-        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({id:i.id,name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||'',cat:i.cat||catOfSaleItem(i)})),total:tot(),disc:damt(),method:payMethod,receipt:receiptStr(payMethod,txid),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:'',shiftId:S.openShift?S.openShift.shiftUid:'',customerId:(S.selectedCustomer&&S.selectedCustomer.id)||null};
+        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({id:i.id,name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||'',cat:i.cat||catOfSaleItem(i),mods:i.mods||null,modLabel:i.modLabel||'',modIngs:i.modIngs||[]})),total:tot(),disc:damt(),discType:S.discType||'',method:payMethod,receipt:receiptStr(payMethod,txid),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:'',shiftId:S.openShift?S.openShift.shiftUid:'',customerId:(S.selectedCustomer&&S.selectedCustomer.id)||null};
         /* Record the delta actually applied on the matching sale line, so a
            later void restores exactly what the sale took and no more. */
         S.cart.forEach((ci,ix)=>{const d=applyStockDelta(ci,-ci.qty);if(tx.items[ix])tx.items[ix].stockDelta=d;});
@@ -6980,6 +7384,46 @@ function renderModal(app){
       totD.style.cssText='background:var(--bg0);border-radius:14px;padding:14px 16px;display:flex;justify-content:space-between;align-items:center';
       totD.innerHTML='<span style="font-size:13px;font-weight:700;color:var(--t3);text-transform:uppercase">Total (VAT incl.)</span><span style="font-size:24px;font-weight:800">'+fmt(tot())+'</span>';
       body.appendChild(totD);
+      /* === NEW: Feature 2 — the QR itself. Rendered between the total and
+         the reference field so the customer can scan while the cashier types
+         the reference. It stays on screen until Confirm or Cancel is pressed,
+         because closeModal() is the only thing that removes it. === */
+      if(m.method==='QR'){
+        const qrBox=document.createElement('div');
+        qrBox.style.cssText='background:#ffffff;border-radius:14px;padding:14px;display:flex;'
+          +'flex-direction:column;align-items:center;gap:8px;margin-top:2px';
+        if(QR_PAYMENT_IMAGE_URL){
+          const qrImg=document.createElement('img');
+          qrImg.src=QR_PAYMENT_IMAGE_URL;
+          qrImg.alt='Scan to pay';
+          qrImg.style.cssText='width:100%;max-width:260px;height:auto;display:block;image-rendering:pixelated';
+          /* A remote URL will not load with the connection down, and the POS
+             is built to keep selling offline. Say so rather than showing a
+             broken image icon. */
+          qrImg.onerror=function(){
+            this.style.display='none';
+            const w=document.createElement('div');
+            w.style.cssText='font-size:12.5px;color:#8a2020;font-weight:600;text-align:center;line-height:1.5';
+            w.textContent='QR image could not load. Show the printed QR instead — the sale still records as QR.';
+            qrBox.appendChild(w);
+          };
+          qrBox.appendChild(qrImg);
+          const cap=document.createElement('div');
+          cap.style.cssText='font-size:12px;font-weight:700;color:#333;letter-spacing:.02em';
+          cap.textContent=QR_PAYMENT_LABEL||'Scan to pay';
+          qrBox.appendChild(cap);
+        } else {
+          const none=document.createElement('div');
+          none.style.cssText='font-size:12.5px;color:#8a2020;font-weight:600;text-align:center;line-height:1.6;padding:6px 2px';
+          none.textContent='No QR image configured yet. Set QR_PAYMENT_IMAGE_URL at the top of index.html. The sale still records as QR and still stays out of the cash drawer.';
+          qrBox.appendChild(none);
+        }
+        body.appendChild(qrBox);
+        const hint=document.createElement('div');
+        hint.style.cssText='font-size:11.5px;color:var(--t3);text-align:center;line-height:1.5';
+        hint.textContent='Confirm only after the payment notification arrives.';
+        body.appendChild(hint);
+      }
       // Reference number input if required
       let refInp=null;
       if(S.requireRef){
@@ -7019,7 +7463,7 @@ function renderModal(app){
         if(!S.cart.length){toast('Cart is empty');return;}
         confirmBtn.dataset.busy='1';confirmBtn.disabled=true;
         const txid=txId();const refNum=refInp?refInp.value.trim():'';
-        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({id:i.id,name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||'',cat:i.cat||catOfSaleItem(i)})),total:tot(),disc:damt(),method:m.method,ref:refNum,receipt:receiptStr(m.method,txid,refNum),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:'',shiftId:S.openShift?S.openShift.shiftUid:'',customerId:(S.selectedCustomer&&S.selectedCustomer.id)||null};
+        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({id:i.id,name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||'',cat:i.cat||catOfSaleItem(i),mods:i.mods||null,modLabel:i.modLabel||'',modIngs:i.modIngs||[]})),total:tot(),disc:damt(),discType:S.discType||'',method:m.method,ref:refNum,receipt:receiptStr(m.method,txid,refNum),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:'',shiftId:S.openShift?S.openShift.shiftUid:'',customerId:(S.selectedCustomer&&S.selectedCustomer.id)||null};
         /* Record the delta actually applied on the matching sale line, so a
            later void restores exactly what the sale took and no more. */
         S.cart.forEach((ci,ix)=>{const d=applyStockDelta(ci,-ci.qty);if(tx.items[ix])tx.items[ix].stockDelta=d;});
@@ -7262,7 +7706,16 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
            path closed the modal straight into a render() that put the
            cashier back at the top of the list. */
         captureScroll();
-        if(cartAdd(p,v.label,{id:p.id,name:p.name,price:v.price!==undefined?v.price:p.price,qty:1,variantLabel:v.label,note:'',cat:p.cat||'Uncategorised'}))toast(p.name+' ('+v.label+') added');
+        /* === NEW: Feature 3/4/5 — a product can carry BOTH a stock-bearing
+           variant and modifier questions. The variant is chosen first (it is
+           the thing with its own stock), then this hands straight over to the
+           flavour/sugar picker at the variant's own price. === */
+        var vPrice=v.price!==undefined?v.price:p.price;
+        if(arroyoHasMods(p)){
+          openModal({type:'modPick',prod:p,variantLabel:v.label,basePrice:vPrice});
+          return;
+        }
+        if(cartAdd(p,v.label,{id:p.id,name:p.name,price:vPrice,qty:1,variantLabel:v.label,note:'',cat:p.cat||'Uncategorised'}))toast(p.name+' ('+v.label+') added');
         closeModal();
       };}
       chips.appendChild(chip);
@@ -7271,6 +7724,147 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
     const btns=document.createElement('div');btns.className='mbtns';
     const cancel=document.createElement('button');cancel.textContent='Cancel';cancel.onclick=closeModal;btns.appendChild(cancel);body.appendChild(btns);
 
+  /* === NEW: Feature 3/4/5 — modifier picker ===
+     One modal serves every group type. It builds its DOM once and mutates
+     chip styling in place rather than calling render(), the same way the
+     discount shortcut buttons do, so nothing outside this branch runs. */
+  } else if(m.type==='modPick'){
+    const p=m.prod;
+    const vLabel=m.variantLabel||'';
+    const groups=arroyoModGroupsFor(p);
+    const base=(m.basePrice!==undefined&&m.basePrice!==null)?+m.basePrice:+p.price;
+    const sel=m.sel||(m.sel=arroyoModDefaults(groups));
+
+    body.innerHTML='<div class="mtitle">'+esc(p.name)+(vLabel?' ('+esc(vLabel)+')':'')+'</div>';
+    const wrap=document.createElement('div');
+    wrap.style.cssText='display:flex;flex-direction:column;gap:16px';
+
+    /* Redrawn after every tap: the running price, the x/3 counter and the
+       inline error all live here so there is one place to keep in sync. */
+    const foot=document.createElement('div');
+    const errEl=document.createElement('div');
+    errEl.style.cssText='font-size:12px;font-weight:600;color:var(--dt);min-height:16px;margin-top:2px';
+    const priceEl=document.createElement('div');
+    priceEl.style.cssText='font-size:15px;font-weight:800;margin-top:4px';
+    const addBtn=document.createElement('button');
+    addBtn.className='mpri';
+    addBtn.style.cssText='flex:1;font-size:15px;padding:14px';
+
+    const counters={};
+    function refresh(){
+      const delta=arroyoModDelta(sel);
+      priceEl.textContent=fmt(base+delta)+(delta?'  ('+fmt(base)+' + '+fmt(delta)+')':'');
+      const err=arroyoModError(sel,groups);
+      errEl.textContent=err;
+      addBtn.textContent=err?'Choose an option':'Add to cart';
+      addBtn.disabled=!!err;
+      addBtn.style.opacity=err?'0.5':'1';
+      Object.keys(counters).forEach(function(k){
+        const d=ARROYO_MOD_GROUPS[k];
+        counters[k].textContent=(sel[k]||[]).length+'/'+d.max+' selected';
+      });
+    }
+
+    groups.forEach(function(gk){
+      const d=ARROYO_MOD_GROUPS[gk];
+      if(!d)return;
+      const sec=document.createElement('div');
+      const hd=document.createElement('div');
+      hd.style.cssText='font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:baseline;gap:8px';
+      const hdL=document.createElement('span');
+      hdL.textContent=d.label+(d.mode==='multi'&&d.max?'':'')+(d.required||d.min?' *':'');
+      hd.appendChild(hdL);
+      if(d.mode==='multi'&&d.max){
+        const cnt=document.createElement('span');
+        cnt.style.cssText='font-size:11px;font-weight:700;color:var(--pt);text-transform:none;letter-spacing:0';
+        counters[gk]=cnt;hd.appendChild(cnt);
+      }
+      sec.appendChild(hd);
+
+      /* Primary flavours first, the rest under a subheading — the menu
+         board highlights BBQ / Cheese / Sour Cream and the cashier reaches
+         for those far more often than Truffle. */
+      const hasPrimary=d.options.some(function(o){return o.primary;});
+      const rows=hasPrimary
+        ?[{t:'',list:d.options.filter(function(o){return o.primary;})},
+          {t:'More flavours',list:d.options.filter(function(o){return !o.primary;})}]
+        :[{t:'',list:d.options}];
+
+      rows.forEach(function(rw){
+        if(!rw.list.length)return;
+        if(rw.t){
+          const sh=document.createElement('div');
+          sh.style.cssText='font-size:10px;font-weight:700;color:var(--t3);margin:10px 0 6px;opacity:.8';
+          sh.textContent=rw.t;sec.appendChild(sh);
+        }
+        const chips=document.createElement('div');
+        chips.style.cssText='display:flex;flex-wrap:wrap;gap:8px';
+        rw.list.forEach(function(o){
+          const chip=document.createElement('div');
+          chip.dataset.v=o.v;
+          function paint(){
+            const on=(sel[gk]||[]).indexOf(o.v)>-1;
+            chip.style.cssText='padding:11px 15px;border-radius:12px;cursor:pointer;'
+              +'font-size:14px;font-weight:600;border:1.5px solid '+(on?'var(--ac)':'var(--b2)')
+              +';background:'+(on?'var(--ac2)':'var(--bg2)')+';color:'+(on?'var(--ac)':'var(--t1)');
+          }
+          chip.innerHTML='<div>'+esc(o.v)+'</div>'
+            +(o.delta?'<div style="font-size:11px;font-weight:700;margin-top:2px;opacity:.85">+'+fmt(o.delta)+'</div>':'');
+          paint();
+          chip.onclick=function(){
+            const cur=sel[gk]||(sel[gk]=[]);
+            const at=cur.indexOf(o.v);
+            if(d.mode==='single'){
+              /* A required single group cannot be emptied by tapping the
+                 chosen chip again — that is how the cashier ends up with a
+                 blank flavour on the kitchen ticket. */
+              if(at>-1&&d.required)return;
+              sel[gk]=at>-1?[]:[o.v];
+            } else {
+              if(at>-1)cur.splice(at,1);
+              else{
+                if(d.max&&cur.length>=d.max){
+                  errEl.textContent='Maximum '+d.max+' flavours';
+                  return;
+                }
+                cur.push(o.v);
+              }
+            }
+            chips.parentNode.querySelectorAll('[data-v]').forEach(function(el){
+              const on=(sel[gk]||[]).indexOf(el.dataset.v)>-1;
+              el.style.border='1.5px solid '+(on?'var(--ac)':'var(--b2)');
+              el.style.background=on?'var(--ac2)':'var(--bg2)';
+              el.style.color=on?'var(--ac)':'var(--t1)';
+            });
+            refresh();
+          };
+          chips.appendChild(chip);
+        });
+        sec.appendChild(chips);
+      });
+      wrap.appendChild(sec);
+    });
+
+    body.appendChild(wrap);
+    foot.appendChild(priceEl);foot.appendChild(errEl);body.appendChild(foot);
+
+    const btns=document.createElement('div');btns.className='mbtns';
+    const cancel=document.createElement('button');cancel.textContent='Cancel';cancel.onclick=closeModal;
+    addBtn.onclick=function(){
+      if(arroyoModError(sel,groups))return;
+      captureScroll();
+      const delta=arroyoModDelta(sel);
+      const modLabel=arroyoModLabel(sel);
+      const line={id:p.id,name:p.name,price:+(base+delta).toFixed(2),qty:1,
+        variantLabel:vLabel,note:'',cat:p.cat||'Uncategorised',
+        origPrice:m.origPrice||null,salePct:m.salePct||0,saleAmt:m.saleAmt||0,
+        mods:JSON.parse(JSON.stringify(sel)),modLabel:modLabel,
+        modKey:arroyoModKey(sel),modIngs:arroyoModIngs(sel)};
+      if(cartAdd(p,vLabel,line,1))toast(p.name+(modLabel?' · '+modLabel:'')+' added');
+      closeModal();
+    };
+    refresh();
+    btns.appendChild(cancel);btns.appendChild(addBtn);body.appendChild(btns);
   } else if(m.type==='quickWastage'){
     body.innerHTML='<div class="mtitle">Log wastage</div>';
     const grid=document.createElement('div');grid.style.cssText='display:flex;flex-direction:column;gap:12px';
@@ -7648,6 +8242,9 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
     box2.appendChild(b2h);
     box2.appendChild(drawerRow('Cash',fmt(r.cashSales||0),{color:'var(--st)'}));
     if(r.gcashSales>0)box2.appendChild(drawerRow('GCash',fmt(r.gcashSales),{color:'var(--pt)'}));
+    /* NEW: Feature 2 — older shift records have no qrSales, so this row is
+       simply absent for shifts closed before this version. */
+    if(r.qrSales>0)box2.appendChild(drawerRow('QR / InstaPay',fmt(r.qrSales),{color:'var(--ac)'}));
     if(r.creditSales>0)box2.appendChild(drawerRow('Credit',fmt(r.creditSales),{color:'var(--wt)'}));
     if(r.otherSales>0)box2.appendChild(drawerRow('Other',fmt(r.otherSales),{color:'var(--t2)'}));
     box2.appendChild(drawerRow('Total sales',fmt(r.totalSales||0),{big:true,rule:true,color:'var(--ac)'}));
@@ -7774,6 +8371,7 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
       sales.appendChild(sHd);
       sales.appendChild(drawerRow('Cash',fmt(bd.cash),{color:'var(--st)'}));
       if(bd.gcash>0)sales.appendChild(drawerRow('GCash (not in drawer)',fmt(bd.gcash),{color:'var(--pt)'}));
+      if(bd.qr>0)sales.appendChild(drawerRow('QR / InstaPay (not in drawer)',fmt(bd.qr),{color:'var(--ac)'}));   /* NEW: Feature 2 */
       if(bd.credit>0)sales.appendChild(drawerRow('Credit (not in drawer)',fmt(bd.credit),{color:'var(--wt)'}));
       if(bd.other>0)sales.appendChild(drawerRow('Other (not in drawer)',fmt(bd.other),{color:'var(--t2)'}));
       sales.appendChild(drawerRow('Total sales',fmt(bd.total),{big:true,rule:true,color:'var(--ac)'}));
@@ -7904,7 +8502,7 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
         const rec=Object.assign({},sh,{
           endedAt:new Date().toISOString(),paidOut:paid,expected:exp,
           countedCash:counted,variance:v,
-          cashSales:bd.cash,gcashSales:bd.gcash,creditSales:bd.credit,
+          cashSales:bd.cash,gcashSales:bd.gcash,qrSales:bd.qr,creditSales:bd.credit,
           otherSales:bd.other,totalSales:bd.total,txCount:bd.count,
           closeNote:((document.getElementById('csNote')||{}).value||'').trim(),
           cloudSynced:false
@@ -8181,7 +8779,7 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
     mfIco.appendChild(icoSel);grid.appendChild(mfIco);
 
     // Sale price section
-    const mfSale=document.createElement('div');mfSale.className='mf';mfSale.innerHTML='<label>Sale / discount %</label>';
+    const mfSale=document.createElement('div');mfSale.className='mf';mfSale.innerHTML='<label>Sale / discount</label>';
     const saleRow=document.createElement('div');saleRow.style.cssText='display:flex;align-items:center;gap:10px;flex-wrap:wrap';
     const saleSel=document.createElement('select');saleSel.id='pSalePct';saleSel.style.cssText='padding:10px 12px;border-radius:10px;border:1.5px solid var(--b2);background:var(--bg2);color:var(--t1);font-size:15px;outline:none;flex:1';
     const saleOpts=[{v:0,l:'No sale (regular price)'},...[5,10,15,20,25,30,40,50,60,70].map(p=>({v:p,l:p+'% off'}))];
@@ -8191,7 +8789,12 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
       const prEl=document.getElementById('pPr');
       const basePrice=prEl?parseFloat(prEl.value)||0:parseFloat(pp.price)||0;
       const pct=parseInt(saleSel.value)||0;
-      salePreview.textContent=pct>0?'→ '+fmt(+(basePrice*(1-pct/100)).toFixed(2)):'';
+      /* NEW: Feature 1 — preview runs through the same helper the till uses,
+         so what the owner sees here is exactly what the tile will charge. */
+      const amtEl=document.getElementById('pSaleAmt');
+      const amt=amtEl?parseFloat(amtEl.value)||0:0;
+      const eff=arroyoEffPrice({price:basePrice,salePct:pct,saleAmt:amt});
+      salePreview.textContent=(pct>0||amt>0)?'→ '+fmt(eff):'';
     }
     saleSel.onchange=updateSalePreview;
     // Wire price input after grid is in DOM
@@ -8200,7 +8803,22 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
       if(prInp)prInp.addEventListener('input',updateSalePreview);
       updateSalePreview();
     },80);
-    saleRow.appendChild(saleSel);saleRow.appendChild(salePreview);mfSale.appendChild(saleRow);grid.appendChild(mfSale);
+    /* === NEW: Feature 1 — fixed peso amount off this product, sitting next
+       to the existing percentage picker. Both can be set; the percentage
+       applies first (see arroyoEffPrice). === */
+    const saleAmtInp=document.createElement('input');
+    saleAmtInp.id='pSaleAmt';saleAmtInp.type='number';saleAmtInp.min='0';saleAmtInp.step='any';
+    saleAmtInp.inputMode='decimal';saleAmtInp.placeholder='or P off';
+    saleAmtInp.value=(+pp.saleAmt>0?pp.saleAmt:'');
+    saleAmtInp.style.cssText='padding:10px 12px;border-radius:10px;border:1.5px solid var(--b2);background:var(--bg2);color:var(--t1);font-size:15px;outline:none;width:110px;flex:0 0 auto';
+    saleAmtInp.oninput=updateSalePreview;
+    saleRow.appendChild(saleSel);saleRow.appendChild(saleAmtInp);saleRow.appendChild(salePreview);
+    mfSale.appendChild(saleRow);
+    const saleHint=document.createElement('div');
+    saleHint.style.cssText='font-size:11px;color:var(--t3);margin-top:6px;line-height:1.5';
+    saleHint.textContent='Leave both blank for regular price. If you set both, the % comes off first, then the peso amount.';
+    mfSale.appendChild(saleHint);
+    grid.appendChild(mfSale);
 
 
     const mfVar=document.createElement('div');mfVar.className='mf';mfVar.innerHTML='<label>Variants (size/color) — optional</label>';
@@ -8234,10 +8852,11 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
       const cat=document.getElementById('pCt').value.trim()||'General';const icon=document.getElementById('pIc').value;
       if(!name){toast('Enter a product name');return;}
       const salePct=parseInt(document.getElementById('pSalePct').value)||0;
+      const saleAmt=Math.max(0,parseFloat((document.getElementById('pSaleAmt')||{}).value)||0);   /* NEW: Feature 1 */
       const cleanVariants=variants.filter(v=>(v.label||'').trim());
       const barcode=(document.getElementById('pBc')||{}).value?document.getElementById('pBc').value.trim():'';
-      if(p){const idx=S.prods.findIndex(x=>x.id===p.id);if(idx>-1)S.prods[idx]={id:p.id,name,price,cat,icon,stock,variants:cleanVariants,img:pendingImg,salePct,barcode};}
-      else S.prods.push({id:S.nid++,name,price,cat,icon,stock,variants:cleanVariants,img:pendingImg,salePct,barcode});
+      if(p){const idx=S.prods.findIndex(x=>x.id===p.id);if(idx>-1)S.prods[idx]={id:p.id,name,price,cat,icon,stock,variants:cleanVariants,img:pendingImg,salePct,saleAmt,barcode};}
+      else S.prods.push({id:S.nid++,name,price,cat,icon,stock,variants:cleanVariants,img:pendingImg,salePct,saleAmt,barcode});
       const cs=[...new Set(S.prods.map(x=>x.cat))];S.cats=['All',...cs];
       const savedP=S.prods.find(function(x){return x.id===(p?p.id:S.nid-1);});
       if(savedP&&savedP.variants&&savedP.variants.length)syncParentStock(savedP);
@@ -8270,6 +8889,7 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
     const totalAmt=filtered.reduce(function(a,s){return a+s.total;},0);
     const cashAmt=filtered.filter(function(s){return s.method==='Cash';}).reduce(function(a,s){return a+s.total;},0);
     const gcashAmt=filtered.filter(function(s){return s.method==='GCash';}).reduce(function(a,s){return a+s.total;},0);
+    const qrAmt=filtered.filter(function(s){return s.method==='QR';}).reduce(function(a,s){return a+s.total;},0);   /* NEW: Feature 2 */
     const utangAmt=filtered.filter(function(s){return s.method==='Utang';}).reduce(function(a,s){return a+s.total;},0);
     /* Card is no longer offered, so its tile is only built when the period
        actually contains Card sales — otherwise the report would carry a
@@ -8284,7 +8904,8 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
       {l:'Total sales',v:filtered.length+' txns',big:false},
       {l:'Total revenue',v:fmt(totalAmt),big:true},
       {l:'Cash',v:fmt(cashAmt),big:false},
-      {l:'GCash',v:fmt(gcashAmt),big:false}
+      {l:'GCash',v:fmt(gcashAmt),big:false},
+      {l:'QR / InstaPay',v:fmt(qrAmt),big:false}   /* NEW: Feature 2 */
     ];
     if(utangAmt>0)rptTiles.push({l:'Credit',v:fmt(utangAmt),big:false});
     if(cardAmt>0)rptTiles.push({l:'Card (legacy)',v:fmt(cardAmt),big:false});
@@ -8397,6 +9018,7 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
         +'<tr><td>Cash</td><td class="r">'+fmt(cashAmt)+'</td></tr>'
         +'<tr><td>Card</td><td class="r">'+fmt(cardAmt)+'</td></tr>'
         +'<tr><td>GCash</td><td class="r">'+fmt(gcashAmt)+'</td></tr>'
+        +'<tr><td>QR / InstaPay</td><td class="r">'+fmt(qrAmt)+'</td></tr>'
         +'</table><hr/>';
       // Items sold summary in print
       const printValidF=filtered.filter(function(s){return !s.voided;});
@@ -8689,12 +9311,19 @@ function findByBarcode(code){
 function scanAddToCart(p){
   if(p.stock!==999&&p.stock<=0){toast(p.name+' is out of stock');return;}
   if(p.variants&&p.variants.length>0){openModal({type:'variantPick',prod:p});return;}
-  const effPrice=(p.salePct>0)?+(p.price*(1-p.salePct/100)).toFixed(2):p.price;
+  const effPrice=arroyoEffPrice(p);   /* NEW: Feature 1 — was inline pct-only */
   /* v7.7.4: a scanner fires far faster than a finger, so this was the
      easiest path of all to push past the shelf count. Same ceiling, and the
      grid holds its place between scans. */
   captureScroll();
-  if(cartAdd(p,null,{id:p.id,name:p.name,price:effPrice,qty:1,note:'',cat:p.cat||'Uncategorised',origPrice:p.salePct>0?p.price:null,salePct:p.salePct||0}))toast('\u2713 '+p.name+' \u00b7 scanned');
+  /* === NEW: Feature 3/4/5 — the scanner is the fifth add-to-cart path and
+     gets the same picker, otherwise a scanned Fries lands with no flavour. === */
+  if(arroyoHasMods(p)){
+    openModal({type:'modPick',prod:p,variantLabel:'',basePrice:effPrice,
+      origPrice:arroyoOnSale(p)?p.price:null,salePct:p.salePct||0,saleAmt:p.saleAmt||0});
+    return;
+  }
+  if(cartAdd(p,null,{id:p.id,name:p.name,price:effPrice,qty:1,note:'',cat:p.cat||'Uncategorised',origPrice:arroyoOnSale(p)?p.price:null,salePct:p.salePct||0,saleAmt:p.saleAmt||0}))toast('\u2713 '+p.name+' \u00b7 scanned');
   render();
 }
 document.addEventListener('keydown',function(e){

@@ -36,4 +36,15 @@ SIGN-IN
   Admin password: Sansanqiqi123*
   Business ID:    77fa344f-8ec9-47a4-b048-c3145e27a9f9
 
-Template version 7.7.5
+SHOP QR (new in 7.8.0)
+  The QR shown for QR / InstaPay payments is embedded inside index.html,
+  so it works with the internet down. To change it, edit this line near
+  the top of index.html:
+
+    var QR_PAYMENT_IMAGE_URL='data:image/png;base64,...';
+
+  A hosted image URL works too, but it will not display offline.
+  Leaving it as an empty string is safe: the sale still records as QR
+  and still stays out of the expected cash drawer.
+
+Template version 7.8.0
