@@ -47,4 +47,4 @@ SHOP QR (new in 7.8.0)
   Leaving it as an empty string is safe: the sale still records as QR
   and still stays out of the expected cash drawer.
 
-Template version 7.8.0
+Template version 7.8.1

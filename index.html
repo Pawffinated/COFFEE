@@ -3648,6 +3648,12 @@ var ARROYO_MOD_GROUPS={
                options:ARROYO_FRIES_FLAVORS},
   friesTrio:  {label:'Fries flavours',mode:'multi',min:1,max:3,
                options:ARROYO_FRIES_FLAVORS},
+  /* 4B: Pancit Canton pack flavour. Deliberately has NO `def`, so the
+     cashier has to pick one and a ticket can never reach the kitchen saying
+     just "Pancit Canton" — the cook would not know which pack to open.
+     Add {v:'Original'} to this list if you start stocking it. */
+  pancitFlavor:{label:'Pancit Canton flavour',mode:'single',required:true,
+               options:[{v:'Calamansi'},{v:'Extra Hot'},{v:'Chilimansi'}]},
   egg:        {label:'Egg',mode:'single',required:true,def:'With Egg',
                options:[{v:'With Egg'},{v:'Without Egg'}]},
   rice:       {label:'Rice',mode:'single',required:true,def:'Regular Rice',
@@ -3679,7 +3685,14 @@ var ARROYO_MOD_INGREDIENTS={
   'Garlic Parmesan':[{name:'Garlic Parmesan Seasoning',qty:1,unit:'pack'}],
   'Truffle':        [{name:'Truffle Seasoning',qty:1,unit:'pack'}],
   'Butter':         [{name:'Butter Seasoning',qty:1,unit:'pack'}],
-  'Sweet Chili':    [{name:'Sweet Chili Seasoning',qty:1,unit:'pack'}]
+  'Sweet Chili':    [{name:'Sweet Chili Seasoning',qty:1,unit:'pack'}],
+  /* Pancit Canton flavours are three separate packs on the shelf, not a
+     seasoning added to a common base, so each deducts its own SKU. Create
+     these three in Prep > Ingredients (unit: pack) to track them; until you
+     do, the names simply do not match and nothing is deducted. */
+  'Calamansi':      [{name:'Pancit Canton Calamansi',qty:1,unit:'pack'}],
+  'Extra Hot':      [{name:'Pancit Canton Extra Hot',qty:1,unit:'pack'}],
+  'Chilimansi':     [{name:'Pancit Canton Chilimansi',qty:1,unit:'pack'}]
   /* Add-ons and rice/egg options deduct nothing by default. To wire one up,
      add a line here, e.g.
        'Extra Espresso':[{name:'Coffee Beans',qty:18,unit:'g'}],
@@ -3774,7 +3787,9 @@ function arroyoModGroupsFor(p){
     if(n.indexOf('trio')>-1)g.push('friesTrio');else g.push('friesFlavor');
   }
   if(n.indexOf('burger')>-1)g.push('patty');
-  if(n.indexOf('pancit')>-1){g.push('egg');g.push('toast');}
+  /* Flavour first: it is the pack the cook reaches for, and the egg and
+     bread questions read as follow-ups to it. */
+  if(n.indexOf('pancit')>-1){g.push('pancitFlavor');g.push('egg');g.push('toast');}
   var isRice=c.indexOf('ricemeal')>-1||ARROYO_RICE_NAMES.indexOf(n)>-1;
   if(isRice){
     /* Sisig with Egg, Sisig without Egg, Spam with Egg and Tocino with Egg
