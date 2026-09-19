@@ -1100,7 +1100,7 @@ function renderOverview(main,fs,fe,rev,exp,net,P){
   two.appendChild(pm);
   const ra=el('div','card');ra.innerHTML='<div class="card-hd">Recent sales</div>';
   fs.slice(0,6).forEach(function(s){
-    const items=(s.items||[]).map(function(i){return i.name;}).join(', ').slice(0,35);
+    const items=(s.items||[]).map(function(i){return itemName(i);}).join(', ').slice(0,50);
     const r=el('div','row');r.innerHTML='<div class="row-l"><div class="row-name">'+items+'</div><div class="row-sub">'+ft(s.date)+'</div></div><div style="font-weight:700;color:var(--ac)">'+fmt(s.total)+'</div>';
     ra.appendChild(r);
   });
@@ -1148,6 +1148,17 @@ function renderOverview(main,fs,fe,rev,exp,net,P){
   },50);
 }
 
+/* NEW 7.8.2 — names an item the way the till does, so a line billed above
+   menu price can be accounted for from the dashboard. The upcharge was always
+   in `price` and in the total; only the naming was missing. */
+function itemName(i){
+  if(!i)return '';
+  var n=String(i.name||'');
+  if(i.variantLabel)n+=' ('+i.variantLabel+')';
+  if(i.modLabel)n+=' - '+i.modLabel;
+  return n;
+}
+
 function renderSales(main,fs,rev){
   main.appendChild(el('div','page-title','Sales'));
   main.appendChild(filterBar());
@@ -1160,7 +1171,7 @@ function renderSales(main,fs,rev){
   const tb=document.createElement('tbody');
   fs.slice(0,100).forEach(function(s){
     const tr=document.createElement('tr');
-    const items=(s.items||[]).map(function(i){return i.name+(i.qty>1?' x'+i.qty:'');}).join(', ').slice(0,40);
+    const items=(s.items||[]).map(function(i){return itemName(i)+(i.qty>1?' x'+i.qty:'');}).join(', ').slice(0,60);
     const mcls={Cash:'b-green',Card:'b-blue',GCash:'b-purple',QR:'b-blue',Utang:'b-amber'}[s.method]||'b-gray';   /* NEW: Feature 2 */
     tr.innerHTML='<td style="font-family:monospace;font-size:11px">'+s.txn_id+'</td><td>'+items+'</td><td style="white-space:nowrap;font-size:12px">'+fd(s.date)+'</td><td style="font-size:12px;color:var(--t3)">'+s.cashier+'</td><td><span class="badge '+mcls+'">'+s.method+'</span></td><td style="text-align:right;font-weight:700">'+fmt(s.total)+'</td>';
     tb.appendChild(tr);
