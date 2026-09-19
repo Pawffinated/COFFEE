@@ -1080,7 +1080,11 @@ function renderOverview(main,fs,fe,rev,exp,net,P){
   /* Card was withdrawn as a tender option in the POS, so it is no longer a
      fixed row. Any method actually present in the data is still listed —
      including historic Card takings — so nothing drops out of the totals. */
-  const baseMethods=['Cash','GCash','Utang'];
+  /* NEW: Feature 2 — QR is a fixed row alongside Cash and GCash so the
+     owner can reconcile the scanned QR account separately. It would have
+     shown up anyway via the seenMethods pass below, but only on days it was
+     used, which makes the card jump around between date filters. */
+  const baseMethods=['Cash','GCash','QR','Utang'];
   const seenMethods=[];
   fs.forEach(function(s){
     const k=s.method||'Cash';
@@ -1157,7 +1161,7 @@ function renderSales(main,fs,rev){
   fs.slice(0,100).forEach(function(s){
     const tr=document.createElement('tr');
     const items=(s.items||[]).map(function(i){return i.name+(i.qty>1?' x'+i.qty:'');}).join(', ').slice(0,40);
-    const mcls={Cash:'b-green',Card:'b-blue',GCash:'b-purple',Utang:'b-amber'}[s.method]||'b-gray';
+    const mcls={Cash:'b-green',Card:'b-blue',GCash:'b-purple',QR:'b-blue',Utang:'b-amber'}[s.method]||'b-gray';   /* NEW: Feature 2 */
     tr.innerHTML='<td style="font-family:monospace;font-size:11px">'+s.txn_id+'</td><td>'+items+'</td><td style="white-space:nowrap;font-size:12px">'+fd(s.date)+'</td><td style="font-size:12px;color:var(--t3)">'+s.cashier+'</td><td><span class="badge '+mcls+'">'+s.method+'</span></td><td style="text-align:right;font-weight:700">'+fmt(s.total)+'</td>';
     tb.appendChild(tr);
   });
@@ -2675,12 +2679,12 @@ function renderModal(root){
       if(isNew){
         // Use local_id one above the current max so it doesn't clash with POS-generated ids
         const maxId=D.products.reduce(function(mx,p){return Math.max(mx,p.local_id||0);},0);
-        const payload={biz_id:SESSION.bizId,local_id:maxId+1,name:nm,price:pr,cat:ct,stock:stk,icon:ic,variants:[],sale_pct:0};
+        const payload={biz_id:SESSION.bizId,local_id:maxId+1,name:nm,price:pr,cat:ct,stock:stk,icon:ic,variants:[],sale_pct:0,sale_amt:0};   /* NEW: Feature 1 */
         const r=await api('/rest/v1/products',{method:'POST',headers:{'Prefer':'return=representation'},body:JSON.stringify(payload)});
         if(!r){alert('Save failed. Check connection.');return;}
       } else {
         // PATCH only the fields the user can edit here.
-        // Preserve variants, img, and sale_pct that come from the POS — do not overwrite them.
+        // Preserve variants, img, sale_pct and sale_amt that come from the POS — do not overwrite them.
         const patch={name:nm,price:pr,cat:ct,stock:stk,icon:ic};
         /* The POS matches cloud products on local_id. A row with a null
            local_id is invisible to that match, so the POS treats its own copy
