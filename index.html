@@ -3546,7 +3546,9 @@ function exportCSV(sales){
   const rows=[['TXN ID','Date','Time','Cashier','Items','Total','Method','Ref','Voided']];
   sales.forEach(s=>{
     rows.push([s.id,new Date(s.date).toLocaleDateString('en-PH'),new Date(s.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),
-      s.cashier||'',s.items.map(i=>i.name+(i.variantLabel?' ('+i.variantLabel+')':'')+' x'+i.qty).join('; '),
+      /* NEW 7.8.2 — add-ons now appear in the export, so a line billed above
+         menu price can be explained from the spreadsheet alone. */
+      s.cashier||'',s.items.map(i=>arroyoItemName(i,true)+' x'+i.qty).join('; '),
       s.total.toFixed(2),s.method,s.ref||'',s.voided?'YES':'NO']);
   });
   const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\r\n');
@@ -3654,10 +3656,25 @@ var ARROYO_MOD_GROUPS={
      Add {v:'Original'} to this list if you start stocking it. */
   pancitFlavor:{label:'Pancit Canton flavour',mode:'single',required:true,
                options:[{v:'Calamansi'},{v:'Extra Hot'},{v:'Chilimansi'}]},
-  egg:        {label:'Egg',mode:'single',required:true,def:'With Egg',
+  /* === 7.8.4 — MEAL ADD-ONS ===
+     Extra Egg is an add-on on the menu board, so it is ticked here rather
+     than asked as a with-or-without question. This ALSO closes a double
+     charge that the previous shape allowed: Extra Rice used to live in its
+     own single-select `rice` group, and putting Extra Egg into a second
+     priced group beside it left two routes to the same P30 line. One group
+     now owns every priced meal extra, so nothing can be added twice.
+
+     Multi-select, nothing preselected, so a plain meal rings at menu price.
+     Add a line here and it appears on every meal at once. */
+  mealAddons: {label:'Add-ons',mode:'multi',min:0,max:0,
+               options:[{v:'Extra Egg',delta:30},{v:'Extra Rice',delta:30}]},
+  /* Free, and only asked of meals whose own name says an egg is included
+     (Sisig with Egg, Spam with Egg, Tocino with Egg, and Pancit Canton if it
+     is stored with "w/ Egg" in the name). It lets a customer decline the egg
+     that is already in the price — a kitchen instruction, not a discount, so
+     there is no delta. Wanting a SECOND egg is Extra Egg above. */
+  eggPref:    {label:'Egg',mode:'single',required:true,def:'With Egg',
                options:[{v:'With Egg'},{v:'Without Egg'}]},
-  rice:       {label:'Rice',mode:'single',required:true,def:'Regular Rice',
-               options:[{v:'Regular Rice'},{v:'Extra Rice',delta:30}]},
   toast:      {label:'Toasted bread',mode:'single',required:true,def:'With Toasted Bread',
                options:[{v:'With Toasted Bread'},{v:'Without Toasted Bread'}]},
   /* 4C: the menu board prices no double patty, so the upcharge is 0 until
@@ -3692,7 +3709,19 @@ var ARROYO_MOD_INGREDIENTS={
      do, the names simply do not match and nothing is deducted. */
   'Calamansi':      [{name:'Pancit Canton Calamansi',qty:1,unit:'pack'}],
   'Extra Hot':      [{name:'Pancit Canton Extra Hot',qty:1,unit:'pack'}],
-  'Chilimansi':     [{name:'Pancit Canton Chilimansi',qty:1,unit:'pack'}]
+  'Chilimansi':     [{name:'Pancit Canton Chilimansi',qty:1,unit:'pack'}],
+  /* 7.8.3 — an egg added as a modifier comes off the same Egg stock as one
+     sold through the Extra Egg menu line. Create "Egg" in
+     Prep > Ingredients (unit: pc) to track it; until then the name does not
+     match and nothing is deducted, exactly as with the seasonings. */
+  /* Only the ADD-ON egg deducts stock. The egg that comes with Sisig with
+     Egg is part of that product's own recipe, so counting 'With Egg' here
+     as well would take two eggs off the shelf for one on the plate. */
+  'Extra Egg':      [{name:'Egg',qty:1,unit:'pc'}],
+  'With Egg':       [],
+  'Without Egg':    []
+  /* 'Extra Rice' deducts nothing by default — add a line here once you know
+     the portion, e.g. [{name:'Rice',qty:1,unit:'cup'}]. */
   /* Add-ons and rice/egg options deduct nothing by default. To wire one up,
      add a line here, e.g.
        'Extra Espresso':[{name:'Coffee Beans',qty:18,unit:'g'}],
@@ -3787,16 +3816,34 @@ function arroyoModGroupsFor(p){
     if(n.indexOf('trio')>-1)g.push('friesTrio');else g.push('friesFlavor');
   }
   if(n.indexOf('burger')>-1)g.push('patty');
+  /* 7.8.4 — every meal gets the priced add-ons (Extra Egg / Extra Rice). The
+     free with-or-without question is asked ONLY of meals whose own name says
+     an egg is already in the price, because that is the only case where there
+     is an egg to decline. "...without Egg" is excluded: that product IS the
+     eggless version.
+
+     The product NAME therefore still matters, but only for the free
+     preference and no longer for the price. Sisig with Egg, Spam with Egg,
+     Tocino with Egg and a Pancit Canton stored as "Pancit Canton w/ Egg &
+     Toasted bread" all ring at menu price and can decline the egg; a plain
+     "Pancit Canton" simply is not asked. Either way an extra egg is P30. */
+  var includesEgg=function(nm){
+    return nm.indexOf('egg')>-1&&nm.indexOf('withoutegg')<0;
+  };
   /* Flavour first: it is the pack the cook reaches for, and the egg and
-     bread questions read as follow-ups to it. */
-  if(n.indexOf('pancit')>-1){g.push('pancitFlavor');g.push('egg');g.push('toast');}
+     bread questions read as follow-ups to it. Egg handled by the same rule
+     the rice meals use, so whether the P70 includes an egg is decided by the
+     product's name rather than by a second hardcoded branch. */
+  if(n.indexOf('pancit')>-1){
+    g.push('pancitFlavor');
+    if(includesEgg(n))g.push('eggPref');
+    g.push('toast');
+    g.push('mealAddons');
+  }
   var isRice=c.indexOf('ricemeal')>-1||ARROYO_RICE_NAMES.indexOf(n)>-1;
   if(isRice){
-    /* Sisig with Egg, Sisig without Egg, Spam with Egg and Tocino with Egg
-       are already separate menu items, so a product whose own name settles
-       the egg question is never asked it. One rule covers all four. */
-    if(n.indexOf('egg')<0&&g.indexOf('egg')<0)g.push('egg');
-    if(g.indexOf('rice')<0)g.push('rice');
+    if(includesEgg(n)&&g.indexOf('eggPref')<0)g.push('eggPref');
+    if(g.indexOf('mealAddons')<0)g.push('mealAddons');
   }
   var isDrink=c.indexOf('icedcoffee')>-1||c.indexOf('noncoffee')>-1
             ||c.indexOf('iceblended')>-1||ARROYO_DRINK_NAMES.indexOf(n)>-1;
@@ -3804,6 +3851,21 @@ function arroyoModGroupsFor(p){
   return g;
 }
 function arroyoHasMods(p){return arroyoModGroupsFor(p).length>0;}
+/* === NEW 7.8.2: the one way an item is named on a receipt, an export, a
+   history row or a reprint. AUDIT FINDING: every one of those sites already
+   charged the right money — `price` has always carried the add-on upcharge —
+   but each printed only `it.name`, so a P125 latte billed at P205 came out as
+   "Cafe Latte ... 205.00" with nothing to explain the extra P80. The customer
+   and the owner both read that as the add-on price going missing.
+   Works on a cart line and on a stored sale item alike. `plain` drops the
+   markup for the fixed-width text receipt. */
+function arroyoItemName(it,plain){
+  if(!it)return '';
+  var n=String(it.name||'');
+  if(it.variantLabel)n+=' ('+it.variantLabel+')';
+  if(!it.modLabel)return n;
+  return plain?n+' - '+it.modLabel:n+' \u00b7 '+it.modLabel;
+}
 
 /* The selection itself is {groupKey:[values]}. Kept as a plain object so it
    drops straight into the sale item JSON with no encoding step. */
@@ -3828,16 +3890,25 @@ function arroyoModKey(sel){
   }).filter(Boolean).join('|');
 }
 /* Cart / receipt summary: "BBQ / Cheese · Less Sugar · +Extra Whip (+P40)" */
-function arroyoModLabel(sel){
+/* `bare` omits the per-option peso amounts. The screen wants them (the
+   cashier is deciding), but a 28-column receipt does not: the line total
+   already accounts for every upcharge, and the extra "(+PHP40.00)" beside
+   each add-on pushed real add-on names into a second wrapped line. */
+function arroyoModLabel(sel,bare){
   if(!sel)return '';
   var parts=[];
   Object.keys(sel).forEach(function(k){
     var d=ARROYO_MOD_GROUPS[k],v=sel[k]||[];
     if(!d||!v.length)return;
-    if(k==='addons'){
+    /* 7.8.4 — was `k==='addons'`, which hard-coded the drink group. Any
+       multi-select group whose options carry a price now reads as a list of
+       "+Item (+P30.00)" entries, so meal add-ons and drink add-ons look the
+       same on the cart and the receipt. friesTrio has no deltas and keeps
+       its "BBQ / Cheese / Sour Cream" form. */
+    if(d.mode==='multi'&&d.options.some(function(o){return o.delta;})){
       v.forEach(function(x){
         var o=d.options.find(function(y){return y.v===x;});
-        parts.push('+'+x+(o&&o.delta?' (+'+fmt(o.delta).replace(/\s/g,'')+')':''));
+        parts.push('+'+x+((!bare&&o&&o.delta)?' (+'+fmt(o.delta).replace(/\s/g,'')+')':''));
       });
     } else {
       var seg=v.join(' / ');
@@ -3845,7 +3916,7 @@ function arroyoModLabel(sel){
         var o=d.options.find(function(y){return y.v===x;});
         return a+((o&&o.delta)||0);
       },0);
-      parts.push(seg+(extra?' (+'+fmt(extra).replace(/\s/g,'')+')':''));
+      parts.push(seg+((!bare&&extra)?' (+'+fmt(extra).replace(/\s/g,'')+')':''));
     }
   });
   return parts.join(' · ');
@@ -4035,7 +4106,37 @@ function receiptStr(method,id,refNum){
   } else {
     rows=[lp(S.bizName,w),line,'Date: '+now.toLocaleString(),'TXN:  '+id,line];
   }
-  S.cart.forEach(i=>{const r=fmt(i.price*i.qty);rows.push(lp(i.name+' x'+i.qty,w-r.length)+r);});
+  /* === NEW 7.8.2 — was `i.name`, which named neither the variant nor the
+     add-ons. A 28-column receipt cannot hold "Cafe Latte - Less Sugar, +Extra
+     Whip" on one line, so the item and its amount stay on the first row and
+     the variant detail wraps onto indented continuation rows beneath it. === */
+  S.cart.forEach(i=>{
+    const r=fmt(i.price*i.qty);
+    rows.push(lp(i.name+' x'+i.qty,w-r.length)+r);
+    const detail=[];
+    if(i.variantLabel)detail.push(i.variantLabel);
+    /* Bare label: names only, no per-add-on peso amounts. Falls back to the
+       stored modLabel for a cart restored from a save that predates `mods`. */
+    var ml=i.mods?arroyoModLabel(i.mods,true):(i.modLabel||'');
+    if(ml)ml.split(' · ').forEach(function(x){detail.push(x);});
+    if(i.qty>1)detail.push('@ '+fmt(i.price)+' each');
+    if(detail.length){
+      /* Wrapped on whole segments, never on words: "Extra Espresso" must not
+         be split across two lines. A segment wider than the paper falls back
+         to a hard slice, which only a pathological option name would reach. */
+      var cur='';
+      detail.forEach(function(seg){
+        if(seg.length>w-2){
+          if(cur){rows.push('  '+cur);cur='';}
+          rows.push('  '+seg.slice(0,w-2));
+          return;
+        }
+        if((cur?cur+', '+seg:seg).length>w-2){rows.push('  '+cur);cur=seg;}
+        else cur=cur?cur+', '+seg:seg;
+      });
+      if(cur)rows.push('  '+cur);
+    }
+  });
   rows.push(line);
   const ar=(l,r)=>rows.push(lp(l,w-r.length)+r);
   ar('Subtotal:',fmt(sub()));
@@ -4162,7 +4263,10 @@ function printReceipt(tx){
   let itemsHtml='';
   (tx.items||[]).forEach(function(it){
     const sub=(it.price*it.qty).toFixed(2);
-    const name=it.name+(it.variantLabel?' ('+it.variantLabel+')':'');
+    /* NEW 7.8.2 — had the variant but not the add-ons. Escaped now too:
+       this string goes into an HTML table and a product named "Ham & Cheese"
+       was being written as raw markup. */
+    const name=esc(arroyoItemName(it));
     itemsHtml+='<tr>'
       +'<td style="text-align:left">'+name+'</td>'
       +'<td style="text-align:center">x'+it.qty+'</td>'
@@ -6489,7 +6593,7 @@ function renderHist(scr){
          otherwise break out of the attribute — and escaped for the label. */
       const mRaw=s.voided?'Voided':(s.method||'Cash');
       const mCls=String(mRaw).replace(/[^A-Za-z0-9]/g,'');
-      card.innerHTML='<div class="txl"><div class="txid">'+esc(s.id)+(s.cashier?' · '+esc(s.cashier):'')+'</div><div class="txitems">'+s.items.map(i=>esc(i.name)+' x'+i.qty).join(', ')+'</div><div class="txtime">'+new Date(s.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div></div><div class="txr"><div class="txtot">'+fmt(s.total)+'</div><div class="txm m'+mCls+'">'+esc(s.voided?'VOID':mRaw)+'</div></div>';
+      card.innerHTML='<div class="txl"><div class="txid">'+esc(s.id)+(s.cashier?' · '+esc(s.cashier):'')+'</div><div class="txitems">'+s.items.map(i=>esc(arroyoItemName(i))+' x'+i.qty).join(', ')+'</div><div class="txtime">'+new Date(s.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div></div><div class="txr"><div class="txtot">'+fmt(s.total)+'</div><div class="txm m'+mCls+'">'+esc(s.voided?'VOID':mRaw)+'</div></div>';
       card.onclick=function(){openModal({type:'viewtx',tx:s});};
       list.appendChild(card);
     });
@@ -7520,7 +7624,7 @@ function renderModal(app){
     const sumRow=document.createElement('div');
     sumRow.style.cssText='background:var(--bg2);border-radius:10px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;margin:6px 0';
     sumRow.innerHTML='<div>'
-      +'<div style="font-size:13px;font-weight:600">'+tx.items.map(i=>i.name+' x'+i.qty).join(', ')+'</div>'
+      +'<div style="font-size:13px;font-weight:600">'+tx.items.map(i=>esc(arroyoItemName(i))+' x'+i.qty).join(', ')+'</div>'
       +'<div style="font-size:11px;color:var(--t3);margin-top:2px">'+tx.method+(tx.cashier?' · '+tx.cashier:'')+'</div>'
       +'</div>'
       +'<div style="font-size:18px;font-weight:800;color:var(--ac);flex-shrink:0;margin-left:12px">PHP '+tx.total.toFixed(2)+'</div>';
@@ -7605,7 +7709,12 @@ function renderModal(app){
       lineSum+=lt;qtySum+=q;
       const row=document.createElement('div');
       row.style.cssText='display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;border-bottom:1px solid var(--b1);font-size:13px';
-      const nm=esc(it.name)+(it.variantLabel?' <span style="color:var(--t3);font-size:11.5px">('+esc(it.variantLabel)+')</span>':'');
+      const nm=esc(it.name)
+        +(it.variantLabel?' <span style="color:var(--t3);font-size:11.5px">('+esc(it.variantLabel)+')</span>':'')
+        /* NEW 7.8.2 — the add-ons are what account for a line priced above the
+           menu figure, so they belong in the detail view that people open
+           precisely to ask "why was this line that much?". */
+        +(it.modLabel?' <span style="color:var(--pt);font-size:11.5px;font-weight:600">'+esc(it.modLabel)+'</span>':'');
       const sub='<span style="color:var(--t3);font-size:11px;display:block">'+fmt(pr)+' each'
         +(it.cat?' · '+esc(it.cat):'')+(it.note?' · '+esc(it.note):'')+'</span>';
       row.innerHTML='<span style="flex:1;min-width:0;color:var(--t1);font-weight:600">'+nm+sub+'</span>'
