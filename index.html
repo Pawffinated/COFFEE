@@ -170,6 +170,11 @@ input,select,textarea{user-select:text;-webkit-user-select:text}
 .mGCash{background:var(--pg);color:var(--pt)}
 .mUtang{background:var(--wg);color:var(--wt)}
 .mTransfer{background:var(--wg);color:var(--wt)}
+/* v7.9.0 — .mSplit is new. .mQR was missing since QR was added in 7.8: the
+   badge had no rule at all, so it rendered as bare text on a transparent
+   pill while every other tender had a colour. */
+.mQR{background:var(--ac2);color:var(--ac)}
+.mSplit{background:var(--pg);color:var(--pt);letter-spacing:.04em}
 
 /* ADMIN */
 .admin-scroll{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
@@ -1279,7 +1284,7 @@ textarea:focus-visible,
 <script>
 const CUR='PHP ',TAX=0.12;
 const CREATOR_PASS='Sansanqiqi123*';
-const CR={name:'Reymar Arroyo',phone:'+639063964052',email:'areymar36@gmail.com',app:'Arroyo POS',ver:'7.7.5'};
+const CR={name:'Reymar Arroyo',phone:'+639063964052',email:'areymar36@gmail.com',app:'Arroyo POS',ver:'7.9.0'};
 const GITHUB_PAGES_URL='https://Pawffinated.github.io/COFFEE';
 const VERSION_URL=GITHUB_PAGES_URL+'/version.json';
 const UPDATE_URL=GITHUB_PAGES_URL+'/index.html';
@@ -2004,7 +2009,13 @@ function salePayload(tx,bizId){
      peso figure (damt() resolves the percentage before it gets here), but
      the TYPE was dropped, so a P20 sale and a 20% sale on a P100 order both
      arrived as 20 and no report could tell them apart. === */
+  /* === NEW v7.9.0 — payments. `method` still carries the scalar (it reads
+     'Split' on a split sale) so nothing that reads the old column breaks,
+     but the per-tender amounts now travel with the sale. NULL, not [], for
+     a sale with no lines: the absence is what marks a legacy row, and the
+     SQL helper keys off it. === */
   return {biz_id:bizId||null,txn_id:tx.id,date:tx.date,total:tx.total,method:tx.method,
+    payments:(Array.isArray(tx.payments)&&tx.payments.length)?tx.payments:null,
     items:tx.items,discount:tx.disc||0,disc_type:tx.discType||'',
     cashier:tx.cashier||'',ref:tx.ref||'',
     voided:tx.voided||false,queue_no:tx.queueNo||null,queue_status:tx.queueStatus||'',
@@ -2711,7 +2722,13 @@ async function loadCloudData(silent){
         console.warn('[Arroyo] '+_resurrected.length+' deleted sale(s) still in the cloud — re-deleting');
         deleteSalesByIdFromCloud(_resurrected.map(function(s){return s.txn_id;}));
       }
-      S.sales=_keep.map(s=>({id:s.txn_id,date:s.date,total:s.total,method:s.method,items:s.items||[],cashier:s.cashier||'',ref:s.ref||'',voided:s.voided||false,receipt:s.receipt||oldReceipts[s.txn_id]||'',disc:s.discount||0,voidedBy:s.voided_by||'',voidedAt:s.voided_at||'',queueNo:s.queue_no||0,queueStatus:s.queue_status||'',queueDay:s.queue_day||null}));
+      /* v7.9.0 — `payments` MUST be listed here. This mapper rebuilds S.sales
+         field by field and drops anything it does not name; that is exactly
+         what used to blank `receipt` and forced the oldReceipts rescue above.
+         Left out, the first sync after a split sale would erase the tender
+         breakdown and the sale would fall back to reporting its whole total
+         under the scalar method. */
+      S.sales=_keep.map(s=>({id:s.txn_id,date:s.date,total:s.total,method:s.method,payments:Array.isArray(s.payments)?s.payments:null,items:s.items||[],cashier:s.cashier||'',ref:s.ref||'',voided:s.voided||false,receipt:s.receipt||oldReceipts[s.txn_id]||'',disc:s.discount||0,voidedBy:s.voided_by||'',voidedAt:s.voided_at||'',queueNo:s.queue_no||0,queueStatus:s.queue_status||'',queueDay:s.queue_day||null}));
       S.salesTotal=S.sales.filter(s=>!s.voided).reduce((a,s)=>a+s.total,0);
     }
     if(Array.isArray(expenses)){S.expenses=expenses.map(e=>({id:e.id,name:e.name,amount:e.amount,cat:e.cat,date:e.date}));}
@@ -3296,6 +3313,11 @@ let S={
   chargeToUtang:false,
   cloudCustomers:[],
   cloudAttEmployees:[],
+  /* v7.9.0 — payment lines being assembled in the split modal. Deliberately
+     NOT persisted by save(): a half-entered split is not a sale, and a
+     reload mid-transaction must land on an empty cart and an empty tender
+     list rather than on a balance the cashier cannot account for. */
+  splitPays:[],
 };
 
 // Everything the deployer pre-configured is applied here, so the client
@@ -3657,13 +3679,18 @@ function applyStockDelta(it,delta){
 }
 
 function exportCSV(sales){
-  const rows=[['TXN ID','Date','Time','Cashier','Items','Total','Method','Ref','Voided']];
+  /* v7.9.0 — three columns APPENDED (never reordered, so an existing sheet
+     or macro that reads by position still finds what it expects): the
+     payment lines, the cash that stayed in the drawer, and the change given.
+     'Method' still holds the scalar, which reads 'Split' on a split sale. */
+  const rows=[['TXN ID','Date','Time','Cashier','Items','Total','Method','Ref','Voided','Payments','Cash in drawer','Change given']];
   sales.forEach(s=>{
     rows.push([s.id,new Date(s.date).toLocaleDateString('en-PH'),new Date(s.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),
       /* NEW 7.8.2 — add-ons now appear in the export, so a line billed above
          menu price can be explained from the spreadsheet alone. */
       s.cashier||'',s.items.map(i=>arroyoItemName(i,true)+' x'+i.qty).join('; '),
-      s.total.toFixed(2),s.method,s.ref||'',s.voided?'YES':'NO']);
+      s.total.toFixed(2),s.method,s.ref||'',s.voided?'YES':'NO',
+      arroyoPayLabel(s),arroyoCashIn(s).toFixed(2),arroyoChange(s).toFixed(2)]);
   });
   const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\r\n');
   const blob=new Blob([csv],{type:'text/csv'});
@@ -4178,6 +4205,197 @@ function sub(){return S.cart.reduce((s,i)=>s+i.price*i.qty,0);}
 function damt(){const s=sub();const d=Math.max(0,S.disc||0);return S.discType==='%'?s*Math.min(d,100)/100:Math.min(d,s);}
 function tamt(){return 0;}
 function tot(){return sub()-damt()+tamt();}
+
+/* ════════════════════════════════════════════════════════════════════════
+   v7.9.0 — SPLIT PAYMENT MODEL
+
+   A sale used to carry one scalar `method`, and fifteen separate places read
+   it. It now carries a `payments` ARRAY, and every one of those places reads
+   it through arroyoPayments() instead.
+
+     payments: [ {m:'Cash',  amt:500, tendered:600},
+                 {m:'GCash', amt:250} ]
+
+   `amt` is what the line settles against the bill, so sum(amt) === total
+   EXACTLY, on every sale, always. That single invariant is what makes
+   sales-by-method add up: a report sums `amt`, never `total`.
+
+   `tendered` appears on a cash line only when the customer handed over more
+   than the line settles. Change is tendered - amt. Which means cash in the
+   drawer — "cash received minus change given" — is just the sum of the cash
+   lines' `amt`: received(tendered) minus change(tendered-amt) IS amt. There
+   is deliberately no separate change column to drift out of step.
+
+   LEGACY SALES: every sale written before this build has no `payments` at
+   all. arroyoPayments() synthesises [{m:tx.method, amt:tx.total}] for them,
+   so they report exactly as they did before — by construction, not by a
+   special case repeated at fifteen call sites. `payments` being absent is
+   meaningful and is never backfilled.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* Money is compared and stored to two decimals throughout. Without this a
+   three-way split of 100.00 into 33.33 + 33.33 + 33.34 leaves a balance of
+   -0.000000000001 and the Complete button never enables. */
+function payRound(n){return Math.round(((+n||0)+Number.EPSILON)*100)/100;}
+
+/* The one way a sale's payment lines are read. Everything downstream — the
+   receipt, the drawer, every tally, the export — goes through here. */
+function arroyoPayments(tx){
+  if(!tx)return [];
+  const raw=tx.payments;
+  if(Array.isArray(raw)&&raw.length){
+    const out=[];
+    raw.forEach(function(p){
+      if(!p)return;
+      const amt=payRound(p.amt);
+      if(!(amt>0))return;
+      const line={m:String(p.m||'Cash'),amt:amt};
+      const t=payRound(p.tendered);
+      if(t>amt)line.tendered=t;
+      if(p.ref)line.ref=String(p.ref);
+      out.push(line);
+    });
+    if(out.length)return out;
+  }
+  /* Legacy sale, or a payments array that survived a sync as junk. Fall back
+     to the scalar method the row has always carried. */
+  return [{m:String(tx.method||'Cash'),amt:payRound(tx.total)}];
+}
+
+/* Cash that stayed in the drawer for this sale: received less change given.
+   Reduces to the sum of the cash lines' `amt` — see the note above. */
+function arroyoCashIn(tx){
+  return payRound(arroyoPayments(tx).reduce(function(a,p){
+    return a+(p.m==='Cash'?p.amt:0);
+  },0));
+}
+
+// Change handed back on this sale, across however many cash lines.
+function arroyoChange(tx){
+  return payRound(arroyoPayments(tx).reduce(function(a,p){
+    return a+(p.tendered&&p.tendered>p.amt?p.tendered-p.amt:0);
+  },0));
+}
+
+// Total cash the customer physically handed over (before change).
+function arroyoCashTendered(tx){
+  return payRound(arroyoPayments(tx).reduce(function(a,p){
+    return a+(p.m==='Cash'?(p.tendered||p.amt):0);
+  },0));
+}
+
+function arroyoIsSplit(tx){return arroyoPayments(tx).length>1;}
+
+/* What goes in the legacy scalar `method` column. A split sale gets the
+   literal 'Split': an unrecognised method already falls through the bottom
+   of methodRows() onto its own row, so anywhere that has NOT been taught
+   about payments yet shows the money as visibly split rather than quietly
+   attributing all of it to one tender. */
+function arroyoMethodLabel(pays){
+  if(!pays||!pays.length)return 'Cash';
+  if(pays.length===1)return pays[0].m;
+  return 'Split';
+}
+
+/* "Cash 500.00 + GCash 250.00" — one line, for the history detail and the
+   CSV export. */
+function arroyoPayLabel(tx,withAmounts){
+  const p=arroyoPayments(tx);
+  return p.map(function(x){
+    return withAmounts===false?x.m:(x.m+' '+x.amt.toFixed(2));
+  }).join(' + ');
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   v7.9.0 — PRINTED RECEIPT TYPE SCALE
+
+   The printed receipt is an HTML document in a popup window, NOT the
+   28-column string receiptStr() builds. receiptStr() feeds the on-screen
+   preview box only and is untouched by this setting, which is why the
+   on-screen layout is byte-for-byte what it was before.
+
+   Thermal paper is a fixed physical width, so type size and characters per
+   line trade off against each other — there is no setting that makes the
+   type bigger AND keeps 32 characters on a 58mm line. So the capacity is
+   what is declared here, and the font size is DERIVED from it rather than
+   typed in as a magic pixel value. Normal is the density you asked for
+   (32 / 48). Large and Extra Large deliberately fit fewer characters and
+   wrap longer names onto a second line; the amount column never wraps and
+   never leaves its line at any scale.
+
+   Courier New advances 0.6em per character, which is the 0.6 below.
+
+   Per DEVICE, not per business: it belongs to the printer on that counter,
+   the same reasoning as the arroyo_fontscale screen setting. It lives in
+   localStorage, survives sign-out and updates, and is never synced. */
+const RECEIPT_SCALES=[
+  {id:'normal',lbl:'Normal',chars:{58:32,80:48}},
+  {id:'large', lbl:'Large', chars:{58:28,80:42}},
+  {id:'xlarge',lbl:'Extra Large',chars:{58:24,80:36}}
+];
+const RECEIPT_SCALE_KEY='arroyo_receipt_scale';
+
+function receiptScale(){
+  /* Default is Large. An unknown or hand-edited value falls back to it
+     rather than leaving the receipt with a scale it cannot size. */
+  var v='';
+  try{v=localStorage.getItem(RECEIPT_SCALE_KEY)||'';}catch(e){}
+  return RECEIPT_SCALES.some(function(s){return s.id===v;})?v:'large';
+}
+function setReceiptScale(id){
+  if(!RECEIPT_SCALES.some(function(s){return s.id===id;}))return;
+  try{localStorage.setItem(RECEIPT_SCALE_KEY,id);}catch(e){}
+}
+
+/* The whole type scale for one (paper width, setting) pair, in px.
+   `usablePx` is the paper width less the print margins. */
+function receiptType(scaleId,mm,usablePx){
+  const sc=RECEIPT_SCALES.filter(function(s){return s.id===scaleId;})[0]||RECEIPT_SCALES[1];
+  const cap=sc.chars[mm]||sc.chars[58];
+  const base=Math.round((usablePx/(cap*0.6))*100)/100;
+  return {
+    id:sc.id,lbl:sc.lbl,chars:cap,base:base,
+    biz:   Math.round(base*1.75*100)/100,  // largest thing on the paper
+    total: Math.round(base*1.35*100)/100,  // strongest: bold, ruled, tracked
+    item:  base,
+    money: base,                            // subtotal / discount / tenders
+    detail:Math.round(base*0.85*100)/100,  // variants and add-ons
+    meta:  Math.round(base*0.80*100)/100,  // date, txn, cashier, tender badge
+    foot:  Math.round(base*0.72*100)/100
+  };
+}
+
+/* ── Live split state, used only while the split modal is open ───────── */
+function splitPaid(){
+  return payRound((S.splitPays||[]).reduce(function(a,p){return a+p.amt;},0));
+}
+function splitRemaining(){return payRound(tot()-splitPaid());}
+function splitChange(){
+  return payRound((S.splitPays||[]).reduce(function(a,p){
+    return a+(p.tendered&&p.tendered>p.amt?p.tendered-p.amt:0);
+  },0));
+}
+
+/* Adds one line. Returns an error string, or '' when accepted.
+
+   The overpayment rule falls out of capping `amt` at the remaining balance:
+   a cash line that exceeds the balance settles the balance and the excess
+   becomes change, which can only ever happen on the line that closes the
+   sale. A non-cash line is refused outright — you cannot hand back change
+   against a GCash transfer. */
+function splitAdd(method,entered){
+  const rem=splitRemaining();
+  const amt=payRound(entered);
+  if(!(amt>0))return 'Enter an amount above zero';
+  if(rem<=0)return 'The balance is already settled';
+  if(amt>rem){
+    if(method!=='Cash')return method+' cannot overpay — the most it can take is '+fmt(rem);
+    S.splitPays.push({m:'Cash',amt:rem,tendered:amt});
+    return '';
+  }
+  S.splitPays.push({m:method,amt:amt});
+  return '';
+}
 function txId(){
   // Timestamp (base36) + 4 random chars = globally unique across devices
   const ts=Date.now().toString(36).toUpperCase();
@@ -4203,7 +4421,11 @@ function initBiz(id){
    changed nothing at all. The live paths now go through cartAdd() and
    cartSetQty() above. */
 
-function receiptStr(method,id,refNum){
+/* v7.9.0 — `pays` is optional and new. Omitted, the function behaves exactly
+   as it always has (one 'Payment: X' row driven by the scalar `method`),
+   which is what the pre-checkout preview in the cash and non-cash modals
+   still wants. Passed, it itemises the tender lines. */
+function receiptStr(method,id,refNum,pays){
   const now=new Date(),w=28;
   const lp=(s,n)=>String(s).length>=n?String(s).slice(0,n):String(s)+' '.repeat(n-String(s).length);
   const rp=(s,n)=>String(s).length>=n?String(s).slice(0,n):' '.repeat(n-String(s).length)+String(s);
@@ -4258,12 +4480,26 @@ function receiptStr(method,id,refNum){
   // VAT already included in price - no separate VAT line
   rows.push(line);
   ar('TOTAL:',fmt(tot()));
-  rows.push('Payment: '+method);
-  if(refNum)rows.push('Ref No:  '+refNum);
-  if(method==='Cash'&&S.cashTendered>=tot()){
-    ar('Cash:',fmt(S.cashTendered));
-    ar('Change:',fmt(S.cashTendered-tot()));
+  /* v7.9.0 — one row per payment line instead of one 'Payment: X' row. The
+     single-payment case renders identically to before apart from the tender
+     name moving into the amount column, which is where it belongs on a
+     receipt anyone has to reconcile. */
+  var _pl=(pays&&pays.length)?pays:null;
+  if(_pl){
+    _pl.forEach(function(p){
+      ar(p.m+':',fmt(p.tendered&&p.tendered>p.amt?p.tendered:p.amt));
+    });
+    var _ch=payRound(_pl.reduce(function(a,p){
+      return a+(p.tendered&&p.tendered>p.amt?p.tendered-p.amt:0);},0));
+    if(_ch>0)ar('Change:',fmt(_ch));
+  } else {
+    rows.push('Payment: '+method);
+    if(method==='Cash'&&S.cashTendered>=tot()){
+      ar('Cash:',fmt(S.cashTendered));
+      ar('Change:',fmt(S.cashTendered-tot()));
+    }
   }
+  if(refNum)rows.push('Ref No:  '+refNum);
   rows.push(line);
   rows.push(rp('Powered by Arroyo POS',w));
   return rows.join('\n');
@@ -4365,88 +4601,166 @@ function code128SVG(text,opts){
 
 // ── PRINT RECEIPT WINDOW ─────────────────────────────────────
 function printReceipt(tx){
-  // Build thermal-friendly HTML receipt
+  /* ══ v7.9.0 REWRITE ═══════════════════════════════════════════════════
+     Three things changed and one bug class was closed.
+
+     1. TYPE SCALE. The whole document used to be 12px body / 11px table
+        with a 15px shop name — effectively one size, unreadable on thermal
+        paper. Every size now derives from receiptType(), which works the
+        base size back from how many characters must fit the paper. Store
+        name is the largest thing on the receipt; TOTAL is the strongest
+        (bold, tracked, double-ruled); item lines sit between; the order
+        details and the footer step down below them.
+
+     2. ITEM LAYOUT. The old four-column table (Item | Qty | Price | Amt)
+        cannot survive a larger font on 58mm paper — the amount column gets
+        squeezed and wraps, which is the one thing a receipt must never do.
+        Each line is now name-and-amount on one row, with qty, unit price,
+        variants and add-ons on an indented sub-row beneath. The amount
+        cell is nowrap with a reserved width, so a long product name wraps
+        under itself and the money stays put on the first row.
+
+     3. PAYMENTS. One row per tender, then change. Reprints included.
+
+     BUG FIXED: this function read `S.cashTendered` — LIVE APP STATE, not
+     the transaction. That is reset to 0 after every sale, so the Cash and
+     Change lines were silently missing from every reprint taken from
+     History. The figures now come off the transaction itself, via
+     arroyoPayments(), which also means a sale from before this build still
+     prints correctly from its scalar method.
+
+     BUG FIXED: shop name, txn id, ref, cashier and the tender name all went
+     into the print HTML raw. Only the item name went through esc(). A shop
+     called "Ham & Cheese" broke the markup and a crafted cashier name would
+     have executed in the popup. Everything is escaped now.
+     ═════════════════════════════════════════════════════════════════════ */
   const isWide=S.thermalWidth==='80'||false; // default 58mm
   const mmW=isWide?80:58;
   const pxW=isWide?302:219; // 80mm≈302px, 58mm≈219px at 96dpi
+  const padPx=4;            // matches the @page body padding below
+  const T=receiptType(receiptScale(),mmW,pxW-(padPx*2));
 
   // Generate barcode SVG for the TXN ID
   const barSVG=code128SVG(tx.id,{height:50,unitW:isWide?2:1.5,quiet:6});
 
-  // Build items rows
+  /* ── Item rows ──────────────────────────────────────────────────────
+     Row 1: name (wraps) .......... amount (never wraps, never separated)
+     Row 2: qty, unit price, variant and add-on detail — only when there
+            is something to say. */
   let itemsHtml='';
   (tx.items||[]).forEach(function(it){
-    const sub=(it.price*it.qty).toFixed(2);
-    /* NEW 7.8.2 — had the variant but not the add-ons. Escaped now too:
-       this string goes into an HTML table and a product named "Ham & Cheese"
-       was being written as raw markup. */
-    const name=esc(arroyoItemName(it));
-    itemsHtml+='<tr>'
-      +'<td style="text-align:left">'+name+'</td>'
-      +'<td style="text-align:center">x'+it.qty+'</td>'
-      +'<td style="text-align:right">'+it.price.toFixed(2)+'</td>'
-      +'<td style="text-align:right">'+sub+'</td>'
+    const q=+it.qty||0,pr=+it.price||0;
+    const lineTotal=(pr*q).toFixed(2);
+    itemsHtml+='<tr class="it">'
+      +'<td class="nm">'+esc(it.name||'')+'</td>'
+      +'<td class="amt">'+lineTotal+'</td>'
       +'</tr>';
+    const det=[];
+    if(q>1)det.push('x'+q+' @ '+pr.toFixed(2));
+    if(it.variantLabel)det.push(it.variantLabel);
+    /* Bare label: names only, no per-add-on peso amounts — the line total
+       above already carries them. Falls back to the stored modLabel for a
+       sale that predates `mods`. */
+    const ml=(it.mods&&typeof arroyoModLabel==='function')?arroyoModLabel(it.mods,true):(it.modLabel||'');
+    if(ml)ml.split(' \u00b7 ').forEach(function(x){det.push(x);});
+    if(it.note)det.push(it.note);
+    if(det.length){
+      itemsHtml+='<tr class="dt"><td class="det" colspan="2">'+esc(det.join(' \u00b7 '))+'</td></tr>';
+    }
   });
 
   // Subtotal, discount, total
-  const subtotal=tx.items.reduce(function(a,i){return a+(i.price*i.qty);},0);
-  const discAmt=subtotal-tx.total;
-  let totalsHtml='<tr><td colspan="3" style="text-align:right">Subtotal</td><td style="text-align:right">'+subtotal.toFixed(2)+'</td></tr>';
-  if(discAmt>0.01){
-    totalsHtml+='<tr><td colspan="3" style="text-align:right">Discount</td><td style="text-align:right">-'+discAmt.toFixed(2)+'</td></tr>';
+  const subtotal=(tx.items||[]).reduce(function(a,i){return a+((+i.price||0)*(+i.qty||0));},0);
+  /* Prefer the discount the sale actually recorded. Deriving it from
+     subtotal - total silently absorbs any rounding drift into a line
+     labelled "Discount", which is a lie on a receipt. */
+  const discAmt=(tx.disc!==undefined&&tx.disc!==null)?(+tx.disc||0):(subtotal-(+tx.total||0));
+  let totalsHtml='<tr class="sm"><td class="nm">Subtotal</td><td class="amt">'+subtotal.toFixed(2)+'</td></tr>';
+  if(discAmt>0.005){
+    totalsHtml+='<tr class="sm"><td class="nm">Discount</td><td class="amt">-'+discAmt.toFixed(2)+'</td></tr>';
   }
-  totalsHtml+='<tr style="font-weight:700;border-top:1px solid #000"><td colspan="3" style="text-align:right">TOTAL</td><td style="text-align:right">'+tx.total.toFixed(2)+'</td></tr>';
+  totalsHtml+='<tr class="tot"><td class="nm">TOTAL</td><td class="amt">'+(+tx.total||0).toFixed(2)+'</td></tr>';
 
-  // Cash change row
-  let cashHtml='';
-  if(tx.method==='Cash'&&S.cashTendered>0){
-    const change=S.cashTendered-tx.total;
-    cashHtml='<tr><td colspan="3" style="text-align:right">Cash</td><td style="text-align:right">'+S.cashTendered.toFixed(2)+'</td></tr>'
-      +'<tr><td colspan="3" style="text-align:right">Change</td><td style="text-align:right">'+Math.max(0,change).toFixed(2)+'</td></tr>';
+  /* ── Tender lines ───────────────────────────────────────────────────
+     One row per payment. A cash line that took more than it settled shows
+     what was handed over; the change follows underneath. */
+  const pays=arroyoPayments(tx);
+  const change=arroyoChange(tx);
+  let payHtml='';
+  pays.forEach(function(p){
+    const shown=(p.tendered&&p.tendered>p.amt)?p.tendered:p.amt;
+    payHtml+='<tr class="sm"><td class="nm">'+esc(p.m)+'</td>'
+      +'<td class="amt">'+shown.toFixed(2)+'</td></tr>';
+    if(p.ref){
+      payHtml+='<tr class="dt"><td class="det" colspan="2">Ref: '+esc(p.ref)+'</td></tr>';
+    }
+  });
+  if(change>0){
+    payHtml+='<tr class="chg"><td class="nm">CHANGE</td><td class="amt">'+change.toFixed(2)+'</td></tr>';
   }
 
-  // Ref number
-  const refHtml=tx.ref?'<div style="font-size:calc(10px * var(--fs,1));margin:2px 0">Ref: '+tx.ref+'</div>':'';
-
-  // Cashier
-  const cashierHtml=tx.cashier?'<div style="font-size:calc(10px * var(--fs,1));margin:2px 0">Cashier: '+tx.cashier+'</div>':'';
+  // Ref number recorded against the sale as a whole.
+  const refHtml=tx.ref?'<div class="meta">Ref: '+esc(tx.ref)+'</div>':'';
+  const cashierHtml=tx.cashier?'<div class="meta">Cashier: '+esc(tx.cashier)+'</div>':'';
+  const queueHtml=tx.queueNo?'<div class="meta qno">No. '+esc(String(tx.queueNo))+'</div>':'';
+  const voidHtml=tx.voided?'<div class="voidmark">*** VOIDED ***</div>':'';
 
   const now=new Date(tx.date);
   const dateStr=now.toLocaleDateString('en-PH',{year:'numeric',month:'short',day:'numeric'});
   const timeStr=now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
 
   // Logo placeholder or biz initials
-  const bizInitials=(S.bizName||'AP').slice(0,2).toUpperCase();
+  const bizInitials=esc((S.bizName||'AP').slice(0,2).toUpperCase());
+  const tenderBadge=esc(arroyoPayLabel(tx,false).toUpperCase());
 
   const html='<!DOCTYPE html><html><head>'
     +'<meta charset="UTF-8">'
-    +'<title>Receipt - '+tx.id+'</title>'
+    +'<title>Receipt - '+esc(tx.id)+'</title>'
     +'<style>'
     +'*{margin:0;padding:0;box-sizing:border-box}'
     +'body{'
     +'  font-family:"Courier New",Courier,monospace;'
-    +'  font-size:12px;'
+    +'  font-size:'+T.base+'px;'
+    +'  line-height:1.35;'
     +'  width:'+pxW+'px;'
     +'  margin:0 auto;'
-    +'  padding:8px 6px;'
+    +'  padding:8px '+padPx+'px;'
     +'  color:#000;'
     +'  background:#fff;'
+    +'  -webkit-font-smoothing:none;'
     +'}'
     +'.center{text-align:center}'
-    +'.divider{border-top:1px dashed #000;margin:6px 0}'
-    +'.divider-solid{border-top:1px solid #000;margin:6px 0}'
-    +'table{width:100%;border-collapse:collapse;font-size:11px}'
-    +'td{padding:2px 1px;vertical-align:top}'
-    +'.biz-name{font-size:15px;font-weight:700;letter-spacing:1px}'
-    +'.txn-id{font-size:10px;color:#333;margin:3px 0}'
+    +'.divider{border-top:1px dashed #000;margin:5px 0}'
+    +'.divider-solid{border-top:1px solid #000;margin:5px 0}'
+    +'table{width:100%;border-collapse:collapse;table-layout:fixed}'
+    +'td{padding:1px 0;vertical-align:top}'
+    /* The amount column: a reserved, non-shrinking, non-wrapping cell. This
+       is the guarantee that a long product name can never push money onto
+       a line of its own. */
+    +'td.amt{width:8.2ch;text-align:right;white-space:nowrap;padding-left:6px;font-variant-numeric:tabular-nums}'
+    +'td.nm{word-break:break-word;overflow-wrap:anywhere}'
+    +'tr.it td{font-size:'+T.item+'px;font-weight:600;padding-top:3px}'
+    +'tr.dt td.det{font-size:'+T.detail+'px;padding-left:2ch;color:#000;word-break:break-word;overflow-wrap:anywhere}'
+    +'tr.sm td{font-size:'+T.money+'px}'
+    /* TOTAL: the strongest line on the paper — heaviest weight, tracked out,
+       ruled above and below. */
+    +'tr.tot td{font-size:'+T.total+'px;font-weight:800;letter-spacing:.04em;'
+    +'  border-top:2px solid #000;border-bottom:2px solid #000;padding:4px 0}'
+    +'tr.tot td.amt{padding-left:6px}'
+    +'tr.chg td{font-size:'+T.money+'px;font-weight:800;border-top:1px dashed #000;padding-top:3px}'
+    +'.biz-name{font-size:'+T.biz+'px;font-weight:800;letter-spacing:.03em;line-height:1.15;word-break:break-word}'
+    +'.meta{font-size:'+T.meta+'px;margin:1px 0}'
+    +'.meta.qno{font-weight:800;font-size:'+T.total+'px;text-align:center;letter-spacing:.06em}'
+    +'.txn-id{font-size:'+T.meta+'px;margin:2px 0;word-break:break-all}'
+    +'.voidmark{font-size:'+T.total+'px;font-weight:800;text-align:center;letter-spacing:.08em;margin:3px 0}'
     +'.method-badge{'
-    +'  display:inline-block;border:1px solid #000;'
-    +'  padding:1px 6px;font-size:10px;font-weight:700;'
-    +'  border-radius:3px;margin:3px 0'
+    +'  display:inline-block;border:1.5px solid #000;'
+    +'  padding:1px 7px;font-size:'+T.meta+'px;font-weight:800;'
+    +'  border-radius:3px;margin:3px 0;letter-spacing:.04em'
     +'}'
-    +'.barcode-wrap{margin:6px auto;text-align:center}'
-    +'.footer{font-size:9px;color:#555;margin-top:4px}'
+    +'.barcode-wrap{margin:5px auto;text-align:center}'
+    +'.barcode-wrap svg{max-width:100%;height:auto}'
+    +'.footer{font-size:'+T.foot+'px;margin-top:4px;line-height:1.4}'
     +'@media print{'
     +'  @page{margin:0;size:'+mmW+'mm auto}'
     +'  body{width:100%;padding:4px}'
@@ -4457,36 +4771,36 @@ function printReceipt(tx){
     // Header
     +'<div class="center">'
     +(S.bizLogo
-      ?'<img src="'+S.bizLogo+'" style="width:48px;height:48px;border-radius:8px;object-fit:contain;margin-bottom:4px"><br>'
-      :'<div style="font-size:20px;font-weight:800;border:2px solid #000;display:inline-block;padding:4px 10px;border-radius:6px;margin-bottom:4px">'+bizInitials+'</div><br>'
+      ?'<img src="'+esc(S.bizLogo)+'" style="width:52px;height:52px;border-radius:8px;object-fit:contain;margin-bottom:4px"><br>'
+      :'<div style="font-size:'+T.biz+'px;font-weight:800;border:2px solid #000;display:inline-block;padding:3px 9px;border-radius:6px;margin-bottom:4px">'+bizInitials+'</div><br>'
     )
-    +'<div class="biz-name">'+S.bizName+'</div>'
+    +'<div class="biz-name">'+esc(S.bizName||'')+'</div>'
     +'</div>'
 
     +'<div class="divider-solid"></div>'
+    +voidHtml
+    +queueHtml
 
     // Date, time, TXN
-    +'<div style="font-size:10px;display:flex;justify-content:space-between">'
-    +'<span>'+dateStr+'</span>'
-    +'<span>'+timeStr+'</span>'
+    +'<div class="meta" style="display:flex;justify-content:space-between">'
+    +'<span>'+esc(dateStr)+'</span>'
+    +'<span>'+esc(timeStr)+'</span>'
     +'</div>'
-    +'<div class="txn-id center">'+tx.id+'</div>'
+    +'<div class="txn-id center">'+esc(tx.id)+'</div>'
     +cashierHtml
     +refHtml
-    +'<div class="center"><span class="method-badge">'+tx.method.toUpperCase()+'</span></div>'
+    +'<div class="center"><span class="method-badge">'+tenderBadge+'</span></div>'
 
     +'<div class="divider"></div>'
 
-    // Items table header
+    // Items
     +'<table>'
-    +'<tr style="border-bottom:1px solid #000;font-weight:700">'
-    +'<td>Item</td><td style="text-align:center">Qty</td>'
-    +'<td style="text-align:right">Price</td><td style="text-align:right">Amt</td>'
-    +'</tr>'
     +itemsHtml
-    +'<tr><td colspan="4"><div class="divider"></div></td></tr>'
+    +'</table>'
+    +'<div class="divider"></div>'
+    +'<table>'
     +totalsHtml
-    +cashHtml
+    +payHtml
     +'</table>'
 
     +'<div class="divider-solid"></div>'
@@ -4504,7 +4818,7 @@ function printReceipt(tx){
 
     // Print button (hidden when printing)
     +'<div class="no-print" style="text-align:center;margin-top:12px">'
-    +'<button onclick="window.print()" style="padding:10px 28px;font-size:14px;font-weight:700;cursor:pointer;border:2px solid #000;background:#000;color:#fff;border-radius:6px">🖨 Print</button>'
+    +'<button onclick="window.print()" style="padding:10px 28px;font-size:14px;font-weight:700;cursor:pointer;border:2px solid #000;background:#000;color:#fff;border-radius:6px">&#128424; Print</button>'
     +'<button onclick="window.close()" style="padding:10px 18px;font-size:14px;cursor:pointer;border:1px solid #ccc;background:#fff;color:#333;border-radius:6px;margin-left:8px">Close</button>'
     +'</div>'
 
@@ -4524,7 +4838,10 @@ function printReceipt(tx){
 function openModal(m){
   S.modal=m;
   // Reserve the customer's number before the receipt is rendered.
-  if(typeof QUEUE_CFG!=='undefined'&&QUEUE_CFG.enabled&&m&&(m.type==='pay'||m.type==='cash'||m.type==='payment')&&!S.pendingQueueNo){
+  /* v7.9.0 — 'split' added. Without it a split-paid sale reaches the receipt
+     with queue number 0, which is the exact v7.1.2 bug this guard exists to
+     prevent, just through a new door. */
+  if(typeof QUEUE_CFG!=='undefined'&&QUEUE_CFG.enabled&&m&&(m.type==='pay'||m.type==='cash'||m.type==='payment'||m.type==='split')&&!S.pendingQueueNo){
     /* v7.1.2 FIX: allocation was async only, so confirming payment before the
        RPC resolved wrote queue_no 0 and printed a receipt with no number on
        it. Take a local number immediately; upgrade it when the server answers. */
@@ -5084,13 +5401,21 @@ function shiftSalesBreakdown(sh){
     if(s.voided){out.voided++;return;}
     const amt=+s.total||0;
     out.count++;out.total+=amt;
-    const m=s.method||'Cash';
-    if(m==='Cash')out.cash+=amt;
-    else if(m==='GCash')out.gcash+=amt;
-    else if(m==='QR')out.qr+=amt;
-    else if(m==='Utang')out.credit+=amt;
-    else out.other+=amt;
+    /* v7.9.0: was one bucket per SALE, keyed on the scalar method — so a
+       split sale put its whole total into one tender and expectedDrawer(),
+       which reads out.cash alone, expected the GCash half to be in the till
+       as notes. Now one bucket per PAYMENT LINE. */
+    arroyoPayments(s).forEach(function(p){
+      if(p.m==='Cash')out.cash+=p.amt;
+      else if(p.m==='GCash')out.gcash+=p.amt;
+      else if(p.m==='QR')out.qr+=p.amt;
+      else if(p.m==='Utang')out.credit+=p.amt;
+      else out.other+=p.amt;
+    });
   });
+  out.cash=payRound(out.cash);out.gcash=payRound(out.gcash);
+  out.qr=payRound(out.qr);out.credit=payRound(out.credit);
+  out.other=payRound(out.other);out.total=payRound(out.total);
   return out;
 }
 
@@ -5230,13 +5555,18 @@ function salesOnDayBreakdown(key){
     if(dayKey(s.date)!==key)return;
     const amt=+s.total||0;
     out.total+=amt;out.count++;
-    const m=s.method||'Cash';
-    if(m==='Cash')out.cash+=amt;
-    else if(m==='GCash')out.gcash+=amt;
-    else if(m==='QR')out.qr+=amt;
-    else if(m==='Utang')out.credit+=amt;
-    else out.other+=amt;
+    // v7.9.0: one bucket per payment line, not per sale. See shiftSalesBreakdown.
+    arroyoPayments(s).forEach(function(p){
+      if(p.m==='Cash')out.cash+=p.amt;
+      else if(p.m==='GCash')out.gcash+=p.amt;
+      else if(p.m==='QR')out.qr+=p.amt;
+      else if(p.m==='Utang')out.credit+=p.amt;
+      else out.other+=p.amt;
+    });
   });
+  out.cash=payRound(out.cash);out.gcash=payRound(out.gcash);
+  out.qr=payRound(out.qr);out.credit=payRound(out.credit);
+  out.other=payRound(out.other);out.total=payRound(out.total);
   return out;
 }
 
@@ -5767,6 +6097,23 @@ function renderCart(scr){
     btn.onclick=function(){S.cashTendered=0;openModal({type:'pay',method:pm.id});};
     pg.appendChild(btn);
   });
+  /* === NEW v7.9.0 — SPLIT. Deliberately a FOURTH BUTTON beside the three
+     tenders rather than a step inserted into them: a one-method sale still
+     takes exactly the taps it took before (tender, amount, confirm), and
+     nobody pays a split-payment tax on the 95% of sales that are not split.
+
+     Hidden while the sale is going on credit — credit is a whole-sale
+     arrangement with one customer's ledger, not a tender you part-pay with. */
+  if(!S.chargeToUtang){
+    const spb=document.createElement('button');
+    spb.className='pbtn';spb.textContent='SPLIT';
+    spb.onclick=function(){
+      if(!S.cart.length){toast('Cart is empty');return;}
+      S.cashTendered=0;S.splitPays=[];
+      openModal({type:'split'});
+    };
+    pg.appendChild(spb);
+  }
   const big=document.createElement('button');big.className='pbtn big';big.textContent='Checkout - '+fmt(tot());
   big.onclick=function(){S.cashTendered=0;openModal({type:'pay',method:'Cash'});};
   pg.appendChild(big);
@@ -6453,16 +6800,29 @@ const PAY_METHODS=[
 
 /* Voided sales are excluded — they took no money. Anything with an
    unrecognised method still gets counted rather than silently dropped. */
+/* v7.9.0: this used to add `s.total` to the bucket named by `s.method`. On a
+   750 sale settled with 500 cash and 250 GCash that put the FULL 750 into
+   whichever single bucket the scalar named — 750 to cash, or 750 to GCash,
+   never 500 and 250. It now adds each payment line's own amount to its own
+   bucket, so the tally sums money moved rather than sales made.
+
+   `count` is per method, so a split sale counts once under Cash and once
+   under GCash. The row totals still add to the period's takings; the counts
+   deliberately do not add to the transaction count, and the caption below
+   the grid says so. */
 function tallyByMethod(txs){
   const t={};
   PAY_METHODS.forEach(function(p){t[p.id]={count:0,total:0};});
   (txs||[]).forEach(function(s){
     if(s.voided)return;
-    const k=s.method||'Cash';
-    if(!t[k])t[k]={count:0,total:0};
-    t[k].count++;
-    t[k].total+=(+s.total||0);
+    arroyoPayments(s).forEach(function(p){
+      const k=p.m||'Cash';
+      if(!t[k])t[k]={count:0,total:0};
+      t[k].count++;
+      t[k].total+=p.amt;
+    });
   });
+  Object.keys(t).forEach(function(k){t[k].total=payRound(t[k].total);});
   return t;
 }
 
@@ -6500,11 +6860,17 @@ function renderPaySummary(scr,txs){
 
   // Spell out what the collected figure does and does not include.
   const credit=tally['Utang']?tally['Utang'].total:0;
-  const collected=rows.reduce(function(a,r){return a+(r.credit?0:r.d.total);},0);
+  const collected=payRound(rows.reduce(function(a,r){return a+(r.credit?0:r.d.total);},0));
+  /* v7.9.0: this counted the tally rows, which now hold one count per PAYMENT
+     LINE. A split sale would have been reported as two sales. Count the sales
+     themselves. */
+  const saleCount=(txs||[]).filter(function(s){return !s.voided;}).length;
+  const splitCount=(txs||[]).filter(function(s){return !s.voided&&arroyoIsSplit(s);}).length;
   const note=document.createElement('div');note.className='paysum-note';
   note.textContent=credit>0
     ? 'Collected '+fmt(collected)+' \u00b7 a further '+fmt(credit)+' is on credit and still owed.'
-    : 'Collected '+fmt(collected)+' across '+rows.reduce(function(a,r){return a+r.d.count;},0)+' sales. Voided sales are excluded.';
+    : 'Collected '+fmt(collected)+' across '+saleCount+' sale'+(saleCount===1?'':'s')
+      +(splitCount?' ('+splitCount+' split across more than one method)':'')+'. Voided sales are excluded.';
   scr.appendChild(note);
 }
 
@@ -6709,7 +7075,11 @@ function renderHist(scr){
       /* The method lands in a class attribute as well as in text. Stripped to
          letters and digits for the class — a method containing a quote would
          otherwise break out of the attribute — and escaped for the label. */
-      const mRaw=s.voided?'Voided':(s.method||'Cash');
+      /* v7.9.0: arroyoMethodLabel over the payment lines rather than the
+         stored scalar, so a sale that synced from a till running an older
+         build — scalar not yet written, payments present — still badges
+         correctly. */
+      const mRaw=s.voided?'Voided':arroyoMethodLabel(arroyoPayments(s));
       const mCls=String(mRaw).replace(/[^A-Za-z0-9]/g,'');
       card.innerHTML='<div class="txl"><div class="txid">'+esc(s.id)+(s.cashier?' · '+esc(s.cashier):'')+'</div><div class="txitems">'+s.items.map(i=>esc(arroyoItemName(i))+' x'+i.qty).join(', ')+'</div><div class="txtime">'+new Date(s.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div></div><div class="txr"><div class="txtot">'+fmt(s.total)+'</div><div class="txm m'+mCls+'">'+esc(s.voided?'VOID':mRaw)+'</div></div>';
       card.onclick=function(){openModal({type:'viewtx',tx:s});};
@@ -7004,6 +7374,44 @@ function renderAdmin(scr){
   tog.onclick=function(){S.requireRef=!S.requireRef;save();saveSettingsToCloud();render();toast('Reference '+(S.requireRef?'required':'optional'));};
   refToggleRow.appendChild(tog);sec1.appendChild(refToggleRow);
 
+  /* ── NEW v7.9.0 — printed receipt font size ──────────────────────────
+     Affects the PRINTED receipt only. The on-screen preview box and every
+     other screen are untouched by it; the screen has its own − / + font
+     scale in the header. Saved per device in localStorage, not synced,
+     because it belongs to the printer standing on that counter. */
+  const rsRow=document.createElement('div');
+  rsRow.style.cssText='padding:10px 0;border-top:1px solid var(--b1)';
+  const rsHd=document.createElement('div');
+  rsHd.innerHTML='<div style="font-size:calc(14px * var(--fs,1));font-weight:600">Printed receipt font size</div>';
+  rsRow.appendChild(rsHd);
+  const rsNote=document.createElement('div');
+  rsNote.style.cssText='font-size:calc(12px * var(--fs,1));color:var(--t3);margin:2px 0 8px;line-height:1.5';
+  rsRow.appendChild(rsNote);
+  const rsGrid=document.createElement('div');
+  rsGrid.style.cssText='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px';
+  const rsPaint=function(){
+    const cur=receiptScale();
+    const mmNow=(S.thermalWidth==='80')?80:58;
+    const t=receiptType(cur,mmNow,(mmNow===80?302:219)-8);
+    rsNote.textContent='Affects printing only \u2014 the screen is unchanged. At '
+      +mmNow+'mm this fits about '+t.chars+' characters a line; longer item names wrap, '
+      +'amounts never do.';
+    Array.prototype.forEach.call(rsGrid.children,function(b){
+      const on=b.dataset.rs===cur;
+      b.style.background=on?'var(--ac2)':'var(--bg0)';
+      b.style.borderColor=on?'var(--ac)':'var(--b2)';
+      b.style.color=on?'var(--t1)':'var(--t2)';
+    });
+  };
+  RECEIPT_SCALES.forEach(function(sc){
+    const b=document.createElement('button');
+    b.dataset.rs=sc.id;b.textContent=sc.lbl;
+    b.style.cssText='padding:11px 4px;border-radius:11px;border:1.5px solid var(--b2);background:var(--bg0);color:var(--t2);font-size:calc(12.5px * var(--fs,1));font-weight:700;cursor:pointer';
+    b.onclick=function(){setReceiptScale(sc.id);rsPaint();toast('Receipt font: '+sc.lbl);};
+    rsGrid.appendChild(b);
+  });
+  rsRow.appendChild(rsGrid);rsPaint();sec1.appendChild(rsRow);
+
   s1btn.appendChild(saveShopBtn);sec1.appendChild(s1btn);scroll.appendChild(sec1);
 
   // Background color
@@ -7219,7 +7627,7 @@ clrSalesBtn.onclick=function(){
     localStorage.removeItem('arroyo_cloud');
     localStorage.removeItem('arroyo_sync_queue');
     CLOUD={user:null,token:null,bizId:null};
-    S={screen:'biz',biz:null,bizName:'',prods:[],cats:[],cart:[],cat:'All',search:'',sort:'name',disc:0,discType:'%',pass:'1234',locked:true,nid:10,sales:[],salesTotal:0,modal:null,histFilter:'all',cashTendered:0,themeColor:'#111110',cartOpen:false,cashiers:[],cashierNid:1,activeCashier:null,shiftStart:null,openShift:null,shiftLog:[],shiftNid:1,histDate:'',expDate:'',ings:[],ingNid:1,recipes:[],recipeNid:1,prepTab:'ing',prepSearch:'',ingFilter:'all',stockLocked:true,alertDismissed:false,cloudEmail:'',cloudBizName:'',authScreen:'login',selectedCustomer:null,chargeToUtang:false,cloudCustomers:[],cloudAttEmployees:[],expenses:[],expenseNid:1,expFilter:'today',dailyGoal:0,requireRef:false,bizLogo:null};
+    S={screen:'biz',biz:null,bizName:'',prods:[],cats:[],cart:[],cat:'All',search:'',sort:'name',disc:0,discType:'%',pass:'1234',locked:true,nid:10,sales:[],salesTotal:0,modal:null,histFilter:'all',cashTendered:0,themeColor:'#111110',cartOpen:false,cashiers:[],cashierNid:1,activeCashier:null,shiftStart:null,openShift:null,shiftLog:[],shiftNid:1,histDate:'',expDate:'',ings:[],ingNid:1,recipes:[],recipeNid:1,prepTab:'ing',prepSearch:'',ingFilter:'all',stockLocked:true,alertDismissed:false,cloudEmail:'',cloudBizName:'',authScreen:'login',selectedCustomer:null,chargeToUtang:false,cloudCustomers:[],cloudAttEmployees:[],expenses:[],expenseNid:1,expFilter:'today',dailyGoal:0,requireRef:false,bizLogo:null,splitPays:[]};
     applyPrefill();applyTheme(S.themeColor);
     render();
   },{tone:'dang'});},{tone:'dang'});};
@@ -7598,7 +8006,21 @@ function renderModal(app){
         confirmBtn.dataset.busy='1';confirmBtn.disabled=true;
         const txid=txId();
         const payMethod=S.chargeToUtang?'Utang':'Cash';
-        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({id:i.id,name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||'',cat:i.cat||catOfSaleItem(i),mods:i.mods||null,modLabel:i.modLabel||'',modIngs:i.modIngs||[]})),total:tot(),disc:damt(),discType:S.discType||'',method:payMethod,receipt:receiptStr(payMethod,txid),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:'',shiftId:S.openShift?S.openShift.shiftUid:'',customerId:(S.selectedCustomer&&S.selectedCustomer.id)||null};
+        /* v7.9.0 — a single-payment sale now carries a one-line `payments`
+           array too. Not for the split feature's sake but because `tendered`
+           finally lives ON THE SALE: printReceipt() used to read the live
+           S.cashTendered, which is zeroed straight after this handler runs,
+           so every reprint from History lost its Cash and Change lines.
+           A credit sale tenders nothing. */
+        const payLines=S.chargeToUtang
+          ? [{m:'Utang',amt:payRound(tot())}]
+          : (function(){
+              const l={m:'Cash',amt:payRound(tot())};
+              const t=payRound(S.cashTendered);
+              if(t>l.amt)l.tendered=t;
+              return [l];
+            })();
+        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({id:i.id,name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||'',cat:i.cat||catOfSaleItem(i),mods:i.mods||null,modLabel:i.modLabel||'',modIngs:i.modIngs||[]})),total:tot(),disc:damt(),discType:S.discType||'',method:payMethod,payments:payLines,receipt:receiptStr(payMethod,txid,'',payLines),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:'',shiftId:S.openShift?S.openShift.shiftUid:'',customerId:(S.selectedCustomer&&S.selectedCustomer.id)||null};
         /* Record the delta actually applied on the matching sale line, so a
            later void restores exactly what the sale took and no more. */
         S.cart.forEach((ci,ix)=>{const d=applyStockDelta(ci,-ci.qty);if(tx.items[ix])tx.items[ix].stockDelta=d;});
@@ -7700,7 +8122,9 @@ function renderModal(app){
         if(!S.cart.length){toast('Cart is empty');return;}
         confirmBtn.dataset.busy='1';confirmBtn.disabled=true;
         const txid=txId();const refNum=refInp?refInp.value.trim():'';
-        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({id:i.id,name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||'',cat:i.cat||catOfSaleItem(i),mods:i.mods||null,modLabel:i.modLabel||'',modIngs:i.modIngs||[]})),total:tot(),disc:damt(),discType:S.discType||'',method:m.method,ref:refNum,receipt:receiptStr(m.method,txid,refNum),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:'',shiftId:S.openShift?S.openShift.shiftUid:'',customerId:(S.selectedCustomer&&S.selectedCustomer.id)||null};
+        // v7.9.0 — one payment line. No tender: a transfer cannot overpay.
+        const payLines=[{m:m.method,amt:payRound(tot())}];
+        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({id:i.id,name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||'',cat:i.cat||catOfSaleItem(i),mods:i.mods||null,modLabel:i.modLabel||'',modIngs:i.modIngs||[]})),total:tot(),disc:damt(),discType:S.discType||'',method:m.method,payments:payLines,ref:refNum,receipt:receiptStr(m.method,txid,refNum,payLines),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:'',shiftId:S.openShift?S.openShift.shiftUid:'',customerId:(S.selectedCustomer&&S.selectedCustomer.id)||null};
         /* Record the delta actually applied on the matching sale line, so a
            later void restores exactly what the sale took and no more. */
         S.cart.forEach((ci,ix)=>{const d=applyStockDelta(ci,-ci.qty);if(tx.items[ix])tx.items[ix].stockDelta=d;});
@@ -7715,11 +8139,280 @@ function renderModal(app){
       btns.appendChild(cancelBtn);btns.appendChild(confirmBtn);body.appendChild(btns);
     }
 
+  } else if(m.type==='split'){
+    /* ══ v7.9.0 — SPLIT PAYMENT ════════════════════════════════════════
+       Total Due at the top, the lines taken so far in the middle, Balance
+       Remaining underneath — all three live. The cashier picks a tender,
+       the amount box is already filled with the whole remaining balance, so
+       settling the rest of a bill is one tap on the tender and one on Add.
+
+       Nothing here can produce a part-paid sale: Complete is disabled until
+       the balance is zero, and the handler re-checks the balance before it
+       touches stock, because the button state is only as fresh as the last
+       repaint.
+       ═════════════════════════════════════════════════════════════════ */
+    if(!Array.isArray(S.splitPays))S.splitPays=[];
+    const total=tot();
+
+    const titleEl=document.createElement('div');titleEl.className='mtitle';
+    titleEl.textContent='Split payment';body.appendChild(titleEl);
+
+    // ── Total due ──
+    const dueBox=document.createElement('div');
+    dueBox.style.cssText='background:var(--bg0);border-radius:14px;padding:13px 16px;display:flex;justify-content:space-between;align-items:center';
+    dueBox.innerHTML='<span style="font-size:calc(13px * var(--fs,1));font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.4px">Total due</span>'
+      +'<span style="font-size:calc(24px * var(--fs,1));font-weight:800">'+fmt(total)+'</span>';
+    body.appendChild(dueBox);
+
+    // ── Payment lines taken so far ──
+    const linesWrap=document.createElement('div');
+    linesWrap.style.cssText='display:flex;flex-direction:column;gap:6px';
+    body.appendChild(linesWrap);
+
+    // ── Balance remaining ──
+    const balBox=document.createElement('div');
+    balBox.style.cssText='border-radius:14px;padding:13px 16px;display:flex;justify-content:space-between;align-items:center;border:1.5px solid var(--b2)';
+    body.appendChild(balBox);
+
+    // ── Tender chooser ──
+    const mLbl=document.createElement('div');
+    mLbl.style.cssText='font-size:calc(11px * var(--fs,1));font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.4px;margin-top:2px';
+    mLbl.textContent='Pay this part with';body.appendChild(mLbl);
+
+    const chips=document.createElement('div');
+    chips.style.cssText='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px';
+    body.appendChild(chips);
+    /* Methods come from PAY_METHODS so the chooser cannot drift from the
+       reporting buckets. Credit is filtered out on purpose — see the Split
+       button in the cart footer. */
+    const splitMethods=PAY_METHODS.filter(function(p){return !p.credit;});
+    let pickM='Cash';
+    const chipEls={};
+    splitMethods.forEach(function(pm){
+      const c=document.createElement('button');
+      c.textContent=pm.lbl;
+      c.style.cssText='padding:12px 6px;border-radius:12px;font-size:calc(13px * var(--fs,1));font-weight:700;cursor:pointer;border:1.5px solid var(--b2);background:var(--bg2);color:var(--t2)';
+      c.onclick=function(){pickM=pm.id;paint();amtInp.focus();};
+      chipEls[pm.id]=c;chips.appendChild(c);
+    });
+
+    // ── Amount for this line ──
+    const amtWrap=document.createElement('div');amtWrap.className='mf';
+    const amtLbl=document.createElement('label');
+    amtLbl.textContent='Amount';amtWrap.appendChild(amtLbl);
+    const amtInp=document.createElement('input');
+    amtInp.type='number';amtInp.min='0';amtInp.step='0.01';amtInp.inputMode='decimal';
+    amtInp.style.cssText='width:100%;padding:14px;border-radius:12px;border:2px solid var(--ac);background:var(--bg2);color:var(--t1);font-size:calc(20px * var(--fs,1));font-weight:700;outline:none';
+    amtWrap.appendChild(amtInp);body.appendChild(amtWrap);
+
+    // Quick amounts — cash only, because only cash is ever handed over round.
+    const qg=document.createElement('div');qg.className='qgrid';body.appendChild(qg);
+
+    // Live change line, shown only when a cash entry exceeds the balance.
+    const chgLine=document.createElement('div');
+    chgLine.style.cssText='font-size:calc(12.5px * var(--fs,1));font-weight:700;text-align:center;line-height:1.5;min-height:1px';
+    body.appendChild(chgLine);
+
+    const addBtn=document.createElement('button');
+    addBtn.style.cssText='width:100%;padding:14px;border-radius:12px;border:none;background:var(--ac);color:#fff;font-size:calc(15px * var(--fs,1));font-weight:800;cursor:pointer';
+    addBtn.textContent='Add payment';body.appendChild(addBtn);
+
+    /* One reference for the whole sale, not one per line — shown as soon as
+       a non-cash line exists and reference numbers are required. */
+    const refWrap=document.createElement('div');refWrap.className='mf';
+    refWrap.innerHTML='<label>Reference / Transaction number *</label>';
+    const refInpS=document.createElement('input');refInpS.type='text';
+    refInpS.placeholder='Enter reference number';
+    refInpS.style.cssText='width:100%;padding:13px;border-radius:12px;border:2px solid var(--ac);background:var(--bg2);color:var(--t1);font-size:calc(15px * var(--fs,1));outline:none';
+    refWrap.appendChild(refInpS);body.appendChild(refWrap);
+
+    const doneBtn=document.createElement('button');
+    doneBtn.className='confirm-btn';doneBtn.textContent='Complete sale';
+    body.appendChild(doneBtn);
+
+    const cancelBtn=document.createElement('button');
+    cancelBtn.style.cssText='width:100%;padding:14px;border-radius:12px;border:1.5px solid var(--b2);background:var(--bg2);color:var(--t1);font-size:calc(14px * var(--fs,1));font-weight:600;cursor:pointer;margin-top:4px';
+    cancelBtn.textContent='Cancel';
+    cancelBtn.onclick=function(){S.splitPays=[];closeModal();};
+    body.appendChild(cancelBtn);
+
+    /* Repaints everything that depends on the lines taken so far. The amount
+       input is never rebuilt, only refilled, so focus and the keyboard stay
+       put on a phone. */
+    function paint(){
+      const rem=splitRemaining();
+      const settled=rem<=0.004;
+
+      // Lines
+      linesWrap.innerHTML='';
+      S.splitPays.forEach(function(p,ix){
+        const row=document.createElement('div');
+        row.style.cssText='display:flex;align-items:center;gap:10px;background:var(--bg2);border:1px solid var(--b1);border-radius:11px;padding:10px 12px';
+        const nm=document.createElement('div');
+        nm.style.cssText='flex:1;min-width:0;font-size:calc(13.5px * var(--fs,1));font-weight:700';
+        nm.textContent=p.m;
+        if(p.tendered&&p.tendered>p.amt){
+          const sub=document.createElement('div');
+          sub.style.cssText='font-size:calc(11px * var(--fs,1));color:var(--t3);font-weight:600;margin-top:2px';
+          sub.textContent='Received '+fmt(p.tendered)+' \u00b7 change '+fmt(p.tendered-p.amt);
+          nm.appendChild(sub);
+        }
+        const amt=document.createElement('div');
+        amt.style.cssText='font-size:calc(15px * var(--fs,1));font-weight:800;color:var(--st);flex-shrink:0';
+        amt.textContent=fmt(p.amt);
+        const del=document.createElement('button');
+        del.textContent='\u00d7';
+        del.style.cssText='background:none;border:none;color:var(--t3);font-size:calc(20px * var(--fs,1));cursor:pointer;padding:0 2px;flex-shrink:0;line-height:1';
+        del.onclick=function(){S.splitPays.splice(ix,1);paint();};
+        row.appendChild(nm);row.appendChild(amt);row.appendChild(del);
+        linesWrap.appendChild(row);
+      });
+
+      // Balance
+      balBox.style.background=settled?'var(--sg)':'var(--bg0)';
+      balBox.style.borderColor=settled?'var(--st)':'var(--b2)';
+      balBox.innerHTML='<span style="font-size:calc(12px * var(--fs,1));font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:'
+        +(settled?'var(--st)':'var(--t3)')+'">Balance remaining</span>'
+        +'<span style="font-size:calc(22px * var(--fs,1));font-weight:800;color:'
+        +(settled?'var(--st)':'var(--ac)')+'">'+fmt(Math.max(0,rem))+'</span>';
+
+      // Tender chips
+      splitMethods.forEach(function(pm){
+        const on=pm.id===pickM;
+        const c=chipEls[pm.id];
+        c.style.background=on?'var(--ac2)':'var(--bg2)';
+        c.style.borderColor=on?'var(--ac)':'var(--b2)';
+        c.style.color=on?'var(--t1)':'var(--t2)';
+        c.disabled=settled;c.style.opacity=settled?'0.4':'1';
+      });
+
+      // Entry row — hidden once there is nothing left to collect
+      const hide=settled?'none':'';
+      amtWrap.style.display=hide;qg.style.display=settled?'none':'grid';
+      addBtn.style.display=hide;mLbl.style.display=hide;chips.style.display=settled?'none':'grid';
+      if(!settled)amtInp.value=rem.toFixed(2);
+
+      // Quick amounts, cash only
+      qg.innerHTML='';
+      if(!settled&&pickM==='Cash'){
+        const ex=document.createElement('button');
+        ex.className='qbtn exact';ex.textContent='Exact - '+fmt(rem);
+        ex.onclick=function(){amtInp.value=rem.toFixed(2);onAmt();};
+        qg.appendChild(ex);
+        [50,100,500,1000,0].forEach(function(add){
+          const b=document.createElement('button');b.className='qbtn';
+          b.textContent=add===0?'Clear':('+'+add.toLocaleString());
+          b.onclick=function(){
+            if(add===0)amtInp.value='';
+            else amtInp.value=payRound((parseFloat(amtInp.value)||0)+add).toFixed(2);
+            onAmt();
+          };
+          qg.appendChild(b);
+        });
+      }
+
+      // Reference: one per sale, only once a non-cash line exists
+      const needRef=S.requireRef&&S.splitPays.some(function(p){return p.m!=='Cash';});
+      refWrap.style.display=needRef?'':'none';
+
+      // Complete
+      doneBtn.className='confirm-btn'+(settled?'':' disabled');
+      doneBtn.textContent=settled?'Complete sale':'Balance of '+fmt(Math.max(0,rem))+' still due';
+
+      onAmt();
+    }
+
+    /* The live change / overpay message under the amount box. This is where
+       the non-cash overpayment refusal is made visible BEFORE the cashier
+       taps Add, rather than as a toast afterwards. */
+    function onAmt(){
+      const rem=splitRemaining();
+      const v=payRound(parseFloat(amtInp.value)||0);
+      chgLine.textContent='';chgLine.style.color='var(--t3)';
+      addBtn.disabled=false;addBtn.style.opacity='1';
+      if(rem<=0.004)return;
+      if(v>rem+0.004){
+        if(pickM==='Cash'){
+          chgLine.textContent='Change due '+fmt(payRound(v-rem));
+          chgLine.style.color='var(--st)';
+        } else {
+          chgLine.textContent=pickM+' cannot overpay \u2014 the most it can take is '+fmt(rem);
+          chgLine.style.color='var(--dt)';
+          addBtn.disabled=true;addBtn.style.opacity='0.45';
+        }
+      }
+    }
+    amtInp.addEventListener('input',onAmt);
+
+    addBtn.onclick=function(){
+      const err=splitAdd(pickM,parseFloat(amtInp.value)||0);
+      if(err){toast(err);return;}
+      /* Default the next line to a different tender: having just paid part
+         in cash, the rest is nearly always going somewhere else. */
+      if(splitRemaining()>0.004&&pickM==='Cash')pickM='GCash';
+      paint();
+    };
+
+    doneBtn.onclick=function(){
+      if(doneBtn.dataset.busy==='1')return;
+      if(!S.cart.length){toast('Cart is empty');return;}
+      /* Re-checked against live state, not the button's painted state. A
+         part-paid sale must not be recordable by any route. */
+      if(splitRemaining()>0.004){toast('Balance of '+fmt(splitRemaining())+' still due');return;}
+      if(!S.splitPays.length){toast('Add a payment first');return;}
+      const needRef=S.requireRef&&S.splitPays.some(function(p){return p.m!=='Cash';});
+      const refNum=refInpS.value.trim();
+      if(needRef&&!refNum){
+        refInpS.style.borderColor='var(--df)';refInpS.focus();
+        toast('Please enter reference number');return;
+      }
+      doneBtn.dataset.busy='1';doneBtn.disabled=true;
+
+      const txid=txId();
+      const payLines=S.splitPays.map(function(p){
+        const l={m:p.m,amt:payRound(p.amt)};
+        if(p.tendered&&p.tendered>p.amt)l.tendered=payRound(p.tendered);
+        return l;
+      });
+      const payMethod=arroyoMethodLabel(payLines);
+      const tx={id:txid,date:new Date().toISOString(),
+        items:S.cart.map(i=>({id:i.id,name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||'',cat:i.cat||catOfSaleItem(i),mods:i.mods||null,modLabel:i.modLabel||'',modIngs:i.modIngs||[]})),
+        total:tot(),disc:damt(),discType:S.discType||'',
+        method:payMethod,payments:payLines,ref:refNum,
+        receipt:receiptStr(payMethod,txid,refNum,payLines),
+        customer:S.selectedCustomer?S.selectedCustomer.name:'',
+        cashier:S.activeCashier?S.activeCashier.name:'',
+        shiftId:S.openShift?S.openShift.shiftUid:'',
+        customerId:(S.selectedCustomer&&S.selectedCustomer.id)||null};
+      /* Identical to the two single-tender handlers from here down: record
+         the delta actually applied on each sale line so a later void
+         restores exactly what the sale took and no more. */
+      S.cart.forEach((ci,ix)=>{const d=applyStockDelta(ci,-ci.qty);if(tx.items[ix])tx.items[ix].stockDelta=d;});
+      const cartCopy=[...S.cart];
+      const capturedChange=arroyoChange(tx);
+      if(typeof QUEUE_CFG!=='undefined'&&QUEUE_CFG.enabled){tx.queueNo=S.pendingQueueNo||0;tx.queueStatus='waiting';tx.queueDay=(function(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');})();}
+      S.sales.push(tx);S.salesTotal+=tot();
+      S.cart=[];S.disc=0;S.discType='%';S.cashTendered=0;S.splitPays=[];S.cartOpen=false;S.pendingQueueNo=0;
+      if(typeof __qzBadge==='function')__qzBadge();
+      S.selectedCustomer=null;S.chargeToUtang=false;
+      save();syncSaleToCloud(tx);recordCustomerSale(tx);tx.ingDeltas=consumeIngredients(cartCopy,-1);save();pushProductStock(cartCopy);
+      closeModal();
+      toast('Sale recorded - '+txid);
+      openModal({type:'receiptReady',tx:tx,cashTendered:capturedChange>0?arroyoCashTendered(tx):0});
+    };
+
+    paint();
+    setTimeout(function(){amtInp.focus();},100);
   } else if(m.type==='receiptReady'){
     // ── POST-SALE RECEIPT MODAL ──
     const tx=m.tx;
     const cashTendered=m.cashTendered||0;
-    const change=cashTendered>0?Math.max(0,cashTendered-tx.total):0;
+    /* v7.9.0: was `cashTendered - tx.total`, which is only right when cash
+       settled the WHOLE bill. On a 750 sale paid with 250 GCash and 600
+       cash it would have shown -150 change. Change comes off the payment
+       lines now, where it is the sum of each cash line's overpayment. */
+    const change=arroyoChange(tx);
+    const txPays=arroyoPayments(tx);
 
     // Big success checkmark
     const success=document.createElement('div');
@@ -7729,8 +8422,10 @@ function renderModal(app){
       +'<div style="font-size:calc(12px * var(--fs,1));color:var(--t3);margin-top:4px">'+tx.id+'</div>';
     body.appendChild(success);
 
-    // Change amount (cash only)
-    if(cashTendered>0){
+    /* v7.9.0: the condition was `cashTendered>0`, so an exact-cash sale put
+       a "Change Due PHP 0.00" box in front of the cashier on every single
+       transaction. It now appears only when money actually goes back. */
+    if(change>0){
       const chBox=document.createElement('div');
       chBox.style.cssText='background:var(--sg);border:1.5px solid var(--st);border-radius:12px;padding:14px;text-align:center;margin:8px 0';
       chBox.innerHTML='<div style="font-size:calc(11px * var(--fs,1));font-weight:700;color:var(--st);text-transform:uppercase;letter-spacing:.5px">Change Due</div>'
@@ -7738,12 +8433,30 @@ function renderModal(app){
       body.appendChild(chBox);
     }
 
+    // Where the money went, when it went to more than one place.
+    if(txPays.length>1){
+      const pbx=document.createElement('div');
+      pbx.style.cssText='background:var(--bg0);border:1px solid var(--b1);border-radius:12px;padding:10px 13px;margin:6px 0';
+      const ph=document.createElement('div');
+      ph.style.cssText='font-size:calc(10px * var(--fs,1));font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px';
+      ph.textContent='Paid with';pbx.appendChild(ph);
+      txPays.forEach(function(p){
+        const r=document.createElement('div');
+        r.style.cssText='display:flex;justify-content:space-between;font-size:calc(13px * var(--fs,1));padding:3px 0';
+        r.innerHTML='<span style="color:var(--t2);font-weight:600">'+esc(p.m)
+          +(p.tendered&&p.tendered>p.amt?' <span style="color:var(--t3);font-weight:400">(received '+fmt(p.tendered)+')</span>':'')
+          +'</span><span style="font-weight:700">'+fmt(p.amt)+'</span>';
+        pbx.appendChild(r);
+      });
+      body.appendChild(pbx);
+    }
+
     // Summary row
     const sumRow=document.createElement('div');
     sumRow.style.cssText='background:var(--bg2);border-radius:10px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;margin:6px 0';
     sumRow.innerHTML='<div>'
       +'<div style="font-size:calc(13px * var(--fs,1));font-weight:600">'+tx.items.map(i=>esc(arroyoItemName(i))+' x'+i.qty).join(', ')+'</div>'
-      +'<div style="font-size:calc(11px * var(--fs,1));color:var(--t3);margin-top:2px">'+tx.method+(tx.cashier?' · '+tx.cashier:'')+'</div>'
+      +'<div style="font-size:calc(11px * var(--fs,1));color:var(--t3);margin-top:2px">'+esc(arroyoPayLabel(tx,false))+(tx.cashier?' · '+esc(tx.cashier):'')+'</div>'
       +'</div>'
       +'<div style="font-size:calc(18px * var(--fs,1));font-weight:800;color:var(--ac);flex-shrink:0;margin-left:12px">PHP '+tx.total.toFixed(2)+'</div>';
     body.appendChild(sumRow);
@@ -7756,13 +8469,13 @@ function renderModal(app){
     printBtn.className='mpri';
     printBtn.style.cssText='flex:2;padding:14px;font-size:calc(15px * var(--fs,1));font-weight:700;border-radius:12px;border:none;background:var(--ac);color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px';
     printBtn.innerHTML='🖨️ Print Receipt';
-    printBtn.onclick=function(){
-      // Temporarily restore cashTendered for print
-      const prevCash=S.cashTendered;
-      S.cashTendered=cashTendered;
-      printReceipt(tx);
-      S.cashTendered=prevCash;
-    };
+    /* v7.9.0: this used to stash, overwrite and restore the global
+       S.cashTendered so printReceipt() could find the tendered amount. That
+       workaround is what made reprints from History lose their Cash and
+       Change lines — History had no global to overwrite. printReceipt()
+       reads the transaction now, so the dance is gone and both routes print
+       identically. */
+    printBtn.onclick=function(){printReceipt(tx);};
 
     const doneBtn=document.createElement('button');
     doneBtn.style.cssText='flex:1;padding:14px;font-size:calc(14px * var(--fs,1));font-weight:600;border-radius:12px;border:1.5px solid var(--b2);background:var(--bg2);color:var(--t1);cursor:pointer';
@@ -7792,7 +8505,12 @@ function renderModal(app){
     meta.style.cssText='font-size:calc(12px * var(--fs,1));color:var(--t3);line-height:1.7;margin-bottom:10px';
     const bits=[new Date(tx.date).toLocaleString('en-PH',{weekday:'short',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})];
     if(tx.cashier)bits.push('Cashier: '+tx.cashier);
-    bits.push('Paid by '+(tx.method||'Cash'));
+    /* v7.9.0: was the scalar method, which on a split sale reads only
+       'Split'. Name the tenders and their amounts — this is the screen
+       people open precisely to ask where the money went. */
+    bits.push('Paid by '+arroyoPayLabel(tx));
+    const vChange=arroyoChange(tx);
+    if(vChange>0)bits.push('Change '+fmt(vChange));
     if(tx.ref)bits.push('Ref: '+tx.ref);
     if(tx.customer)bits.push('Customer: '+tx.customer);
     if(tx.queueNo)bits.push('Queue #'+tx.queueNo);
@@ -9129,14 +9847,21 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
       return sd.toISOString().slice(0,10)===date;
     });
     const totalAmt=filtered.reduce(function(a,s){return a+s.total;},0);
-    const cashAmt=filtered.filter(function(s){return s.method==='Cash';}).reduce(function(a,s){return a+s.total;},0);
-    const gcashAmt=filtered.filter(function(s){return s.method==='GCash';}).reduce(function(a,s){return a+s.total;},0);
-    const qrAmt=filtered.filter(function(s){return s.method==='QR';}).reduce(function(a,s){return a+s.total;},0);   /* NEW: Feature 2 */
-    const utangAmt=filtered.filter(function(s){return s.method==='Utang';}).reduce(function(a,s){return a+s.total;},0);
+    /* v7.9.0: these were six `filter(s.method===X).reduce(+s.total)` passes,
+       so a split sale threw its whole total at one tender and the tiles no
+       longer added up to the revenue figure above them. One tally, summing
+       payment amounts. */
+    const rptTally=tallyByMethod(filtered);
+    const tallyOf=function(k){return rptTally[k]?rptTally[k].total:0;};
+    const cashAmt=tallyOf('Cash');
+    const gcashAmt=tallyOf('GCash');
+    const qrAmt=tallyOf('QR');
+    const utangAmt=tallyOf('Utang');
     /* Card is no longer offered, so its tile is only built when the period
        actually contains Card sales — otherwise the report would carry a
        permanent PHP 0.00 line for a tender nobody can take. */
-    const cardAmt=filtered.filter(function(s){return s.method==='Card';}).reduce(function(a,s){return a+s.total;},0);
+    const cardAmt=tallyOf('Card');
+    const splitCnt=filtered.filter(function(s){return !s.voided&&arroyoIsSplit(s);}).length;
 
     const titleEl=document.createElement('div');titleEl.className='mtitle';titleEl.textContent='Sales Report - '+label;body.appendChild(titleEl);
 
@@ -9151,6 +9876,7 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
     ];
     if(utangAmt>0)rptTiles.push({l:'Credit',v:fmt(utangAmt),big:false});
     if(cardAmt>0)rptTiles.push({l:'Card (legacy)',v:fmt(cardAmt),big:false});
+    if(splitCnt>0)rptTiles.push({l:'Split-paid sales',v:splitCnt+' txn',big:false});
     rptTiles.push({l:'Avg sale',v:filtered.length?fmt(totalAmt/filtered.length):fmt(0),big:false});
     rptTiles.forEach(function(s){
       const box=document.createElement('div');box.style.cssText='background:var(--bg0);border-radius:12px;padding:12px';
@@ -9286,9 +10012,11 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
         html+='<div class="tx">';
         html+='<div style="display:flex;justify-content:space-between">'
           +'<span style="font-size:11px;color:#666">'+s.id+' &bull; '+new Date(s.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</span>'
-          +'<span style="font-size:11px;color:#666">'+s.method+'</span>'
+          /* v7.9.0: was the scalar method, which reads 'Split' and says
+             nothing about where the money went. Name the lines. */
+          +'<span style="font-size:11px;color:#666">'+esc(arroyoPayLabel(s))+'</span>'
           +'</div>';
-        if(s.ref)html+='<div style="font-size:11px;color:#666">Ref: '+s.ref+'</div>';
+        if(s.ref)html+='<div style="font-size:11px;color:#666">Ref: '+esc(s.ref)+'</div>';
         html+='<table style="margin:4px 0">';
         s.items.forEach(function(it){
           html+='<tr>'
