@@ -539,6 +539,93 @@ async function saveSettingsToCloud(patch){
   }catch(e){}
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+   v7.9.0 — SPLIT PAYMENT ACCESSORS
+
+   Identical in behaviour to the POS's. A sale used to carry one scalar
+   `method`; it now also carries a `payments` array:
+
+     payments: [ {m:'Cash', amt:500, tendered:600}, {m:'GCash', amt:250} ]
+
+   `amt` is what the line settles, so sum(amt) === total exactly. A report
+   sums `amt`, never `total` — that is what stops a 750 split sale being
+   counted as 750 of cash AND 750 of GCash, or as 750 of whichever tender
+   the scalar happened to name.
+
+   `payments` being ABSENT is meaningful: it marks a sale written before
+   v7.9.0. Those get one synthesised line from the scalar they already
+   carry, so they report exactly as they did before. Nothing is backfilled.
+
+   The dashboard fetches sales with no `select=` clause, so PostgREST
+   returns every column and `payments` arrives automatically once the
+   migration has run. On a database where it has NOT run, the column is
+   simply missing from every row and every sale takes the legacy path —
+   which is the pre-v7.9.0 behaviour, unchanged. This file is therefore
+   safe to deploy before or after the SQL.
+   ═══════════════════════════════════════════════════════════════════════ */
+function payRound(n){return Math.round(((+n||0)+Number.EPSILON)*100)/100;}
+
+function arroyoPayments(s){
+  if(!s)return [];
+  const raw=s.payments;
+  if(Array.isArray(raw)&&raw.length){
+    const out=[];
+    raw.forEach(function(p){
+      if(!p)return;
+      const amt=payRound(p.amt);
+      if(!(amt>0))return;
+      const line={m:String(p.m||'Cash'),amt:amt};
+      const t=payRound(p.tendered);
+      if(t>amt)line.tendered=t;
+      if(p.ref)line.ref=String(p.ref);
+      out.push(line);
+    });
+    if(out.length)return out;
+  }
+  return [{m:String(s.method||'Cash'),amt:payRound(s.total)}];
+}
+
+// Cash that stayed in the drawer: received less change given.
+function arroyoCashIn(s){
+  return payRound(arroyoPayments(s).reduce(function(a,p){
+    return a+(p.m==='Cash'?p.amt:0);},0));
+}
+function arroyoChange(s){
+  return payRound(arroyoPayments(s).reduce(function(a,p){
+    return a+(p.tendered&&p.tendered>p.amt?p.tendered-p.amt:0);},0));
+}
+function arroyoIsSplit(s){return arroyoPayments(s).length>1;}
+
+function arroyoMethodLabel(pays){
+  if(!pays||!pays.length)return 'Cash';
+  if(pays.length===1)return pays[0].m;
+  return 'Split';
+}
+// "Cash 500.00 + GCash 250.00"
+function arroyoPayLabel(s,withAmounts){
+  return arroyoPayments(s).map(function(x){
+    return withAmounts===false?x.m:(x.m+' '+x.amt.toFixed(2));
+  }).join(' + ');
+}
+
+/* {method:{total,count}} for a set of sales, summing PAYMENT AMOUNTS.
+   `count` is per tender, so a split sale counts once under each method it
+   used — the totals still add to the period's takings, the counts
+   deliberately do not add to the transaction count. */
+function tallyByMethod(sales){
+  const t={};
+  (sales||[]).forEach(function(s){
+    if(s.voided)return;
+    arroyoPayments(s).forEach(function(p){
+      const k=p.m||'Cash';
+      if(!t[k])t[k]={total:0,count:0};
+      t[k].total+=p.amt;t[k].count++;
+    });
+  });
+  Object.keys(t).forEach(function(k){t[k].total=payRound(t[k].total);});
+  return t;
+}
+
 function filteredSales(){
   const now=new Date();
   return D.sales.filter(function(s){
@@ -1085,18 +1172,37 @@ function renderOverview(main,fs,fe,rev,exp,net,P){
      shown up anyway via the seenMethods pass below, but only on days it was
      used, which makes the card jump around between date filters. */
   const baseMethods=['Cash','GCash','QR','Utang'];
+  /* v7.9.0: this used to be two filter/reduce passes per method over
+     `s.method` and `s.total`. On a 750 sale settled with 500 cash and 250
+     GCash, `method` reads 'Split', so cash and GCash both showed nothing
+     for it and a 'Split' row appeared holding the whole 750. It now sums
+     the payment lines, so the 500 lands under Cash and the 250 under
+     GCash. Legacy sales yield one line from their scalar and are
+     unaffected. */
+  const mTally=tallyByMethod(fs);
   const seenMethods=[];
-  fs.forEach(function(s){
-    const k=s.method||'Cash';
+  Object.keys(mTally).forEach(function(k){
     if(baseMethods.indexOf(k)===-1&&seenMethods.indexOf(k)===-1)seenMethods.push(k);
   });
   baseMethods.concat(seenMethods).forEach(function(m){
-    const a=fs.filter(function(s){return s.method===m;}).reduce(function(a,s){return a+s.total;},0);
-    const cnt=fs.filter(function(s){return s.method===m;}).length;
+    const d=mTally[m]||{total:0,count:0};
+    const a=d.total;
+    const cnt=d.count;
     const pct=rev>0?Math.round(a/rev*100):0;
-    const r=el('div','row');r.innerHTML='<div class="row-l"><div class="row-name">'+m+'</div><div class="row-sub">'+cnt+' txns</div></div><div class="row-r"><div style="font-weight:700;color:var(--ac)">'+fmt(a)+'</div><div style="font-size:11px;color:var(--t3)">'+pct+'%</div></div>';
+    const r=el('div','row');r.innerHTML='<div class="row-l"><div class="row-name">'+m+'</div><div class="row-sub">'+cnt+(cnt===1?' payment':' payments')+'</div></div><div class="row-r"><div style="font-weight:700;color:var(--ac)">'+fmt(a)+'</div><div style="font-size:11px;color:var(--t3)">'+pct+'%</div></div>';
     pm.appendChild(r);
   });
+  /* Says plainly why the payment counts can exceed the transaction count,
+     so nobody reconciles the two and concludes the figures are broken. */
+  const splitN=fs.filter(function(s){return arroyoIsSplit(s);}).length;
+  if(splitN>0){
+    const note=el('div','row');
+    note.innerHTML='<div class="row-sub" style="padding:2px 0;line-height:1.5">'
+      +splitN+(splitN===1?' sale was':' sales were')+' settled with more than one tender, '
+      +'so the amounts above are split across methods and the payment counts total '
+      +'more than the transaction count.</div>';
+    pm.appendChild(note);
+  }
   two.appendChild(pm);
   const ra=el('div','card');ra.innerHTML='<div class="card-hd">Recent sales</div>';
   fs.slice(0,6).forEach(function(s){
@@ -1172,8 +1278,14 @@ function renderSales(main,fs,rev){
   fs.slice(0,100).forEach(function(s){
     const tr=document.createElement('tr');
     const items=(s.items||[]).map(function(i){return itemName(i)+(i.qty>1?' x'+i.qty:'');}).join(', ').slice(0,60);
-    const mcls={Cash:'b-green',Card:'b-blue',GCash:'b-purple',QR:'b-blue',Utang:'b-amber'}[s.method]||'b-gray';   /* NEW: Feature 2 */
-    tr.innerHTML='<td style="font-family:monospace;font-size:11px">'+s.txn_id+'</td><td>'+items+'</td><td style="white-space:nowrap;font-size:12px">'+fd(s.date)+'</td><td style="font-size:12px;color:var(--t3)">'+s.cashier+'</td><td><span class="badge '+mcls+'">'+s.method+'</span></td><td style="text-align:right;font-weight:700">'+fmt(s.total)+'</td>';
+    /* v7.9.0: the badge read the scalar, which on a split sale says only
+       'Split'. It now names the tenders — this table is where an owner
+       goes to ask where a specific sale's money went. */
+    const pays=arroyoPayments(s);
+    const mLbl=arroyoMethodLabel(pays);
+    const mcls={Cash:'b-green',Card:'b-blue',GCash:'b-purple',QR:'b-blue',Utang:'b-amber',Split:'b-purple'}[mLbl]||'b-gray';
+    const mTxt=pays.length>1?arroyoPayLabel(s):mLbl;
+    tr.innerHTML='<td style="font-family:monospace;font-size:11px">'+s.txn_id+'</td><td>'+items+'</td><td style="white-space:nowrap;font-size:12px">'+fd(s.date)+'</td><td style="font-size:12px;color:var(--t3)">'+s.cashier+'</td><td><span class="badge '+mcls+'" style="white-space:nowrap">'+mTxt+'</span></td><td style="text-align:right;font-weight:700">'+fmt(s.total)+'</td>';
     tb.appendChild(tr);
   });
   tbl.appendChild(tb);c.appendChild(tbl);main.appendChild(c);
@@ -2872,8 +2984,11 @@ function renderModal(root){
 }
 
 function exportCSV(sales){
-  const rows=[['ID','Date','Time','Cashier','Items','Total','Method','Ref','Voided']];
-  sales.forEach(function(s){rows.push([s.txn_id,new Date(s.date).toLocaleDateString('en-PH'),ft(s.date),s.cashier||'',(s.items||[]).map(function(i){return i.name+' x'+(i.qty||1);}).join('; '),s.total.toFixed(2),s.method,s.ref||'',s.voided?'YES':'NO']);});
+  /* v7.9.0 — three columns APPENDED, never reordered, so an existing sheet
+     or macro reading by position still finds what it expects. Same three
+     the POS export adds, in the same order, so the two files line up. */
+  const rows=[['ID','Date','Time','Cashier','Items','Total','Method','Ref','Voided','Payments','Cash in drawer','Change given']];
+  sales.forEach(function(s){rows.push([s.txn_id,new Date(s.date).toLocaleDateString('en-PH'),ft(s.date),s.cashier||'',(s.items||[]).map(function(i){return i.name+' x'+(i.qty||1);}).join('; '),s.total.toFixed(2),s.method,s.ref||'',s.voided?'YES':'NO',arroyoPayLabel(s),arroyoCashIn(s).toFixed(2),arroyoChange(s).toFixed(2)]);});
   const csv=rows.map(function(r){return r.map(function(v){return'"'+String(v).replace(/"/g,'""')+'"';}).join(',');}).join('\r\n');
   const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='sales-'+new Date().toISOString().slice(0,10)+'.csv';a.style.display='none';document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove();},1500);
 }
